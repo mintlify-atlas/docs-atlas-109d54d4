@@ -1,0 +1,169 @@
+---
+title: "Variable-Length Sequences"
+description: "Processing batches with different sequence lengths using flash_attn_varlen_func"
+---
+
+When sequences in a batch have different lengths, padding them to the same length wastes compute: the model performs attention over padding tokens that carry no information. The varlen functions eliminate padding by packing all sequences end-to-end into a single flat tensor.
+
+## How packing works
+
+Instead of a 3-D tensor `(batch, seqlen, ...)`, the varlen API uses a 2-D tensor `(total_tokens, ...)` where `total_tokens` is the sum of all sequence lengths. Sequence boundaries are tracked with cumulative sequence length tensors (`cu_seqlens`).
+
+**Example:** a batch of 3 sequences with lengths `[128, 256, 512]`:
+
+```
+cu_seqlens = [0, 128, 384, 896]
+             #   ^128  ^128+256  ^128+256+512
+```
+
+Sequence `i` occupies token indices `cu_seqlens[i] : cu_seqlens[i + 1]` in the flat tensor.
+
+<Note>
+  `cu_seqlens` must be a `torch.int32` tensor on CUDA. Using `int64` or CPU
+  tensors will raise an error.
+</Note>
+
+## flash_attn_varlen_func
+
+```python
+from flash_attn import flash_attn_varlen_func
+
+out = flash_attn_varlen_func(
+    q, k, v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+)
+```
+
+**Tensor shapes:**
+
+| Tensor         | Shape | Description |
+| -------------- | ----- | ----------- |
+| `q`            | `(total_q, nheads, headdim)` | All query tokens packed |
+| `k`            | `(total_k, nheads_k, headdim)` | All key tokens packed |
+| `v`            | `(total_k, nheads_k, headdim)` | All value tokens packed |
+| `cu_seqlens_q` | `(batch_size + 1,)` int32 | Cumulative query sequence lengths |
+| `cu_seqlens_k` | `(batch_size + 1,)` int32 | Cumulative key sequence lengths |
+| output         | `(total_q, nheads, headdim)` | Packed output |
+
+**Complete example:**
+
+```python
+import torch
+from flash_attn import flash_attn_varlen_func
+
+device = "cuda"
+dtype  = torch.float16
+nheads, headdim = 16, 64
+
+# Three sequences of different lengths
+seq_lengths = [128, 256, 512]
+total_tokens = sum(seq_lengths)
+
+# Build cu_seqlens: prepend 0, then cumsum
+cu_seqlens = torch.tensor([0] + seq_lengths, dtype=torch.int32, device=device).cumsum(0)
+# cu_seqlens = tensor([  0, 128, 384, 896], dtype=torch.int32)
+
+max_seqlen = max(seq_lengths)  # 512
+
+q = torch.randn(total_tokens, nheads, headdim, device=device, dtype=dtype)
+k = torch.randn(total_tokens, nheads, headdim, device=device, dtype=dtype)
+v = torch.randn(total_tokens, nheads, headdim, device=device, dtype=dtype)
+
+out = flash_attn_varlen_func(
+    q, k, v,
+    cu_seqlens_q=cu_seqlens,
+    cu_seqlens_k=cu_seqlens,
+    max_seqlen_q=max_seqlen,
+    max_seqlen_k=max_seqlen,
+    dropout_p=0.0,
+    causal=True,
+)
+# out: (896, 16, 64)
+```
+
+## Building cu_seqlens from a list of lengths
+
+A reusable helper:
+
+```python
+import torch
+
+def lengths_to_cu_seqlens(lengths, device="cuda"):
+    """Convert a list of sequence lengths to cumulative sequence lengths."""
+    lengths_tensor = torch.tensor(lengths, dtype=torch.int32, device=device)
+    cu_seqlens = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
+    cu_seqlens[1:] = lengths_tensor.cumsum(0)
+    return cu_seqlens
+
+# Example
+cu_seqlens = lengths_to_cu_seqlens([128, 256, 512])
+# tensor([  0, 128, 384, 896], dtype=torch.int32, device='cuda:0')
+```
+
+## flash_attn_varlen_qkvpacked_func
+
+Use this when Q, K, and V are already stacked. Avoids explicit gradient concatenation in the backward pass.
+
+```python
+from flash_attn import flash_attn_varlen_qkvpacked_func
+
+# qkv: (total, 3, nheads, headdim)
+qkv = torch.randn(total_tokens, 3, nheads, headdim, device=device, dtype=dtype)
+
+out = flash_attn_varlen_qkvpacked_func(
+    qkv,
+    cu_seqlens=cu_seqlens,
+    max_seqlen=max_seqlen,
+    dropout_p=0.0,
+    causal=True,
+)
+# out: (total_tokens, nheads, headdim)
+```
+
+## flash_attn_varlen_kvpacked_func
+
+Use this when K and V are stacked but Q is separate. Supports GQA/MQA.
+
+```python
+from flash_attn import flash_attn_varlen_kvpacked_func
+
+nheads_q, nheads_k = 32, 8
+
+# q:  (total_q, nheads_q, headdim)
+# kv: (total_k, 2, nheads_k, headdim)
+q  = torch.randn(total_tokens, nheads_q, headdim, device=device, dtype=dtype)
+kv = torch.randn(total_tokens, 2, nheads_k, headdim, device=device, dtype=dtype)
+
+out = flash_attn_varlen_kvpacked_func(
+    q, kv,
+    cu_seqlens_q=cu_seqlens,
+    cu_seqlens_k=cu_seqlens,
+    max_seqlen_q=max_seqlen,
+    max_seqlen_k=max_seqlen,
+    dropout_p=0.0,
+    causal=True,
+)
+# out: (total_tokens, nheads_q, headdim)
+```
+
+## Additional parameters
+
+All varlen functions accept the same optional parameters as their non-varlen counterparts:
+
+| Parameter       | Description |
+| --------------- | ----------- |
+| `causal`        | Apply causal (auto-regressive) mask |
+| `window_size`   | `(left, right)` for sliding window local attention |
+| `alibi_slopes`  | `(nheads,)` or `(batch_size, nheads)` fp32 ALiBi biases |
+| `softmax_scale` | Override the default `1 / sqrt(headdim)` scale |
+| `deterministic` | Use deterministic backward pass (slower, reproducible) |
+| `dropout_p`     | Dropout probability (set to `0.0` at evaluation) |

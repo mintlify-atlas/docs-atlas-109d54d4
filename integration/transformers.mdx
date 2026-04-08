@@ -1,0 +1,130 @@
+---
+title: "Transformer Integration"
+description: "Integrating FlashAttention into transformer models as a drop-in attention replacement"
+---
+
+FlashAttention is a drop-in replacement for standard scaled dot-product attention. It computes the exact same result as `torch.nn.functional.scaled_dot_product_attention` while using significantly less memory and running faster, especially at long sequence lengths.
+
+<Note>
+  FlashAttention requires `float16` or `bfloat16` inputs. It does not support
+  `float32`. Cast your model and inputs to a half-precision dtype before using
+  FlashAttention.
+</Note>
+
+## Drop-in for `scaled_dot_product_attention`
+
+The low-level `flash_attn_func` accepts Q, K, V tensors in `(batch, seqlen, nheads, headdim)` layout and returns the same shape:
+
+```python
+import torch
+from flash_attn import flash_attn_func
+
+# q, k, v: (batch_size, seqlen, nheads, headdim), fp16 or bf16
+out = flash_attn_func(q, k, v, causal=True)
+```
+
+If Q, K, V are already packed into a single tensor, use `flash_attn_qkvpacked_func` for a faster backward pass:
+
+```python
+from flash_attn import flash_attn_qkvpacked_func
+
+# qkv: (batch_size, seqlen, 3, nheads, headdim)
+out = flash_attn_qkvpacked_func(qkv, dropout_p=0.0, causal=True)
+```
+
+## Using the `MHA` module
+
+`flash_attn.modules.mha.MHA` is a full multi-head attention layer that wraps QKV projection, FlashAttention, and output projection. Set `use_flash_attn=True` to enable the FlashAttention kernel:
+
+```python
+import torch
+from flash_attn.modules.mha import MHA
+
+attn = MHA(
+    embed_dim=1024,
+    num_heads=16,
+    use_flash_attn=True,   # enable FlashAttention kernel
+    causal=True,           # autoregressive masking
+    dropout=0.0,
+).cuda().to(torch.float16)
+
+# x: (batch_size, seqlen, embed_dim)
+out = attn(x)
+```
+
+`MHA` also supports grouped-query attention (GQA) and multi-query attention (MQA) via `num_heads_kv`, rotary embeddings via `rotary_emb_dim`, and ALiBi via `use_alibi`.
+
+## Replacing `nn.MultiheadAttention` in a PyTorch model
+
+The following shows how to swap PyTorch's built-in `MultiheadAttention` for `MHA` in an existing encoder layer:
+
+```python
+import torch.nn as nn
+from flash_attn.modules.mha import MHA
+
+
+class FlashTransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048):
+        super().__init__()
+        # Replace nn.MultiheadAttention with MHA
+        self.self_attn = MHA(
+            embed_dim=d_model,
+            num_heads=nhead,
+            use_flash_attn=True,
+            causal=False,
+        )
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        x = self.norm1(x + self.self_attn(x))
+        x = self.norm2(x + self.linear2(torch.relu(self.linear1(x))))
+        return x
+```
+
+## HuggingFace Transformers
+
+Many HuggingFace models support FlashAttention natively. Pass `attn_implementation="flash_attention_2"` when loading a model:
+
+```python
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-7b-hf",
+    attn_implementation="flash_attention_2",
+    torch_dtype=torch.float16,
+).cuda()
+```
+
+This works for Llama, Mistral, Falcon, GPT-NeoX, and other supported architectures. Refer to the HuggingFace documentation for the full list of compatible models.
+
+## Supported frameworks
+
+<CardGroup cols={2}>
+  <Card title="PyTorch" icon="python">
+    Integrated into `torch.nn.Transformer` via the `scaled_dot_product_attention`
+    dispatch mechanism. Available in PyTorch 2.0+.
+  </Card>
+  <Card title="HuggingFace Transformers" icon="face-smile">
+    Native support via `attn_implementation="flash_attention_2"` on most modern
+    language model architectures.
+  </Card>
+  <Card title="Megatron-LM" icon="server">
+    Integrated into NVIDIA's large-scale distributed training framework for
+    training multi-billion parameter transformer models.
+  </Card>
+  <Card title="DeepSpeed" icon="bolt">
+    Integrated into Microsoft DeepSpeed's inference engine for accelerated
+    transformer inference.
+  </Card>
+  <Card title="MosaicML Composer" icon="layer-group">
+    Available as a component in the Composer training library for efficient
+    neural network training.
+  </Card>
+  <Card title="EleutherAI GPT-NeoX" icon="brain">
+    Supported in the GPT-NeoX research library for large-scale language model
+    training based on Megatron-LM and DeepSpeed.
+  </Card>
+</CardGroup>

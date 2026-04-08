@@ -1,0 +1,193 @@
+---
+title: "flash_attn_varlen_func (FA4)"
+description: "FlashAttention-4 variable-length attention for packed sequences"
+---
+
+```python
+from flash_attn.cute import flash_attn_varlen_func
+```
+
+`flash_attn_varlen_func` runs FlashAttention-4 on **packed sequences** — multiple sequences of different lengths concatenated along the token dimension, with offsets stored in cumulative sequence length tensors. This avoids wasted computation on padding tokens and is the standard approach for training on batches with mixed sequence lengths.
+
+The semantics match the FA2 `flash_attn_varlen_func`: `cu_seqlens_q` and `cu_seqlens_k` describe the sequence boundaries within the packed tensors.
+
+## Signature
+
+```python
+flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    seqused_q=None,
+    seqused_k=None,
+    page_table=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(None, None),
+    learnable_sink=None,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    score_mod=None,
+    aux_tensors=None,
+    return_lse=False,
+)
+```
+
+## Parameters
+
+### Core inputs
+
+<ParamField body="q" type="torch.Tensor" required>
+  Query tensor of shape `(total_tokens_q, num_heads, head_dim)`. All sequences in the batch are concatenated along the first dimension. Must be BF16 or FP16, on a CUDA device, and contiguous in the last dimension.
+</ParamField>
+
+<ParamField body="k" type="torch.Tensor" required>
+  Key tensor of shape `(total_tokens_k, num_heads_kv, head_dim)`. For GQA/MQA, `num_heads` must be divisible by `num_heads_kv`.
+</ParamField>
+
+<ParamField body="v" type="torch.Tensor" required>
+  Value tensor of shape `(total_tokens_k, num_heads_kv, head_dim_v)`.
+</ParamField>
+
+### Sequence offsets
+
+<ParamField body="cu_seqlens_q" type="torch.Tensor" required>
+  Cumulative sequence lengths for Q. Shape `(batch + 1,)`, dtype `int32`, contiguous. `cu_seqlens_q[i]` is the start token index of sequence `i`; `cu_seqlens_q[-1]` equals `total_tokens_q`. For example, three sequences of lengths `[3, 5, 2]` give `[0, 3, 8, 10]`.
+</ParamField>
+
+<ParamField body="cu_seqlens_k" type="torch.Tensor" required>
+  Cumulative sequence lengths for K/V. Shape `(batch + 1,)`, dtype `int32`, contiguous.
+</ParamField>
+
+<ParamField body="max_seqlen_q" type="int | None" default="None">
+  Maximum sequence length among all Q sequences in the batch. If `None`, it is inferred as `total_tokens_q`. Providing this explicitly avoids a CPU-side scan and can improve performance.
+</ParamField>
+
+<ParamField body="max_seqlen_k" type="int | None" default="None">
+  Maximum sequence length among all K/V sequences. If `None`, inferred from the shape of `k`.
+</ParamField>
+
+<ParamField body="seqused_q" type="torch.Tensor | None" default="None">
+  Optional per-sequence actual Q lengths. Shape `(batch,)`, dtype `int32`. Overrides the lengths derived from `cu_seqlens_q` when sequences are padded within the packed buffer.
+</ParamField>
+
+<ParamField body="seqused_k" type="torch.Tensor | None" default="None">
+  Optional per-sequence actual K/V lengths. Shape `(batch,)`, dtype `int32`.
+</ParamField>
+
+### Paged KV (Blackwell only)
+
+<ParamField body="page_table" type="torch.Tensor | None" default="None">
+  Page table for paged KV cache. Shape `(batch, max_pages_per_seq)`, dtype `int32`. When provided, `k` and `v` are interpreted as `(num_pages, page_size, num_heads_kv, head_dim)`. Cannot be combined with `cu_seqlens_k`. Blackwell (SM100/SM110) only.
+</ParamField>
+
+### Attention options
+
+<ParamField body="softmax_scale" type="float" default="1 / sqrt(head_dim)">
+  Scaling factor applied to `Q @ K^T` before the softmax.
+</ParamField>
+
+<ParamField body="causal" type="bool" default="false">
+  Apply a causal (autoregressive) mask. Each query token attends only to key tokens at or before its own position within the sequence.
+</ParamField>
+
+<ParamField body="window_size" type="tuple[int | None, int | None]" default="(None, None)">
+  `(left, right)` token window for sliding window (local) attention. `None` means no limit on that side.
+</ParamField>
+
+<ParamField body="softcap" type="float" default="0.0">
+  Applies logit softcapping before the softmax. Set to `0.0` to disable.
+</ParamField>
+
+### GQA / performance
+
+<ParamField body="pack_gqa" type="bool | None" default="None">
+  Pack multiple Q heads per KV head for more efficient GQA. Defaults to `True` when `num_heads > num_heads_kv`. Note: `pack_gqa` is disabled automatically when `num_splits > 1` and varlen is active.
+</ParamField>
+
+<ParamField body="num_splits" type="int" default="1">
+  Number of KV splits (FlashDecoding). Blackwell only. Pass `0` to let the runtime pick automatically.
+</ParamField>
+
+<ParamField body="deterministic" type="bool" default="false">
+  Use the deterministic backward pass.
+</ParamField>
+
+### Score modifier
+
+<ParamField body="score_mod" type="Callable | None" default="None">
+  A `@cute.jit`-decorated callable that modifies the attention score of each token pair before the softmax. Injected at JIT compile time. See [Score & Mask Modifiers](/api/advanced-modifiers).
+
+  Signature: `score_mod(score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors) -> score`
+
+  Within `score_mod`, `seqlen_info.offset_q` and `seqlen_info.offset_k` give the packed-buffer start offset for the current sequence, so you can compute global token positions.
+</ParamField>
+
+<ParamField body="aux_tensors" type="list[torch.Tensor] | None" default="None">
+  Additional tensors made available to `score_mod` as `aux_tensors[i]`. Useful for passing learned biases, position embeddings, or document IDs without closure capture.
+</ParamField>
+
+### Learnable sink
+
+<ParamField body="learnable_sink" type="torch.Tensor | None" default="None">
+  Per-head learnable sink token bias. Shape `(num_heads,)`, dtype BF16.
+</ParamField>
+
+### Output options
+
+<ParamField body="return_lse" type="bool" default="false">
+  Also return the log-sum-exp of each row's attention scores. Shape `(num_heads, total_tokens_q)`, dtype `float32`.
+</ParamField>
+
+## Return value
+
+<ResponseField name="out" type="torch.Tensor">
+  Attention output of shape `(total_tokens_q, num_heads, head_dim_v)`, same dtype as `q`.
+</ResponseField>
+
+<ResponseField name="lse" type="torch.Tensor | None">
+  Log-sum-exp of shape `(num_heads, total_tokens_q)`, dtype `float32`. Only allocated when `return_lse=True` or when any input requires a gradient.
+</ResponseField>
+
+## Example
+
+```python
+import torch
+from flash_attn.cute import flash_attn_varlen_func
+
+device = "cuda"
+dtype  = torch.bfloat16
+
+# Three sequences of lengths [256, 512, 128], packed together
+seqlens = [256, 512, 128]
+total   = sum(seqlens)
+nheads, nheads_kv, headdim = 16, 4, 128
+
+q = torch.randn(total, nheads,    headdim, device=device, dtype=dtype)
+k = torch.randn(total, nheads_kv, headdim, device=device, dtype=dtype)
+v = torch.randn(total, nheads_kv, headdim, device=device, dtype=dtype)
+
+# Build cumulative sequence lengths (int32, contiguous)
+cu_seqlens = torch.tensor([0, 256, 768, 896], dtype=torch.int32, device=device)
+
+out, lse = flash_attn_varlen_func(
+    q, k, v,
+    cu_seqlens_q=cu_seqlens,
+    cu_seqlens_k=cu_seqlens,
+    max_seqlen_q=512,
+    max_seqlen_k=512,
+    causal=True,
+    return_lse=True,
+)
+# out: (896, 16, 128)
+```
+
+<Note>
+  `mask_mod` is not yet supported with variable-length sequences. Use `score_mod` for per-token-pair score adjustments in varlen mode.
+</Note>

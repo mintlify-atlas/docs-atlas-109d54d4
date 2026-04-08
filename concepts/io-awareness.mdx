@@ -1,0 +1,59 @@
+---
+title: "IO-Aware Attention"
+description: "How FlashAttention's tiling algorithm avoids the memory bottleneck of standard attention"
+---
+
+Standard attention computes the full N×N attention matrix and writes it to HBM (high bandwidth memory — the main GPU DRAM). This is the central bottleneck: HBM is large but slow. At sequence length 2048, the attention matrix alone requires 2048 × 2048 × 4 bytes = **16MB per head, per layer, per forward pass**. For a typical transformer with many heads and layers, this adds up fast.
+
+FlashAttention is described as "IO-aware" because it's designed around minimizing expensive HBM reads and writes, not just minimizing FLOPs.
+
+## The memory hierarchy
+
+Modern GPUs have two relevant memory tiers:
+
+| Memory | Bandwidth | Capacity (A100) |
+|--------|-----------|-----------------|
+| SRAM (on-chip, shared memory) | ~19 TB/s | ~20 MB total |
+| HBM (off-chip, main GPU memory) | ~2 TB/s | ~80 GB |
+
+SRAM is roughly 10× faster than HBM, but tiny in comparison. The challenge is to do as much computation as possible in SRAM without spilling to HBM.
+
+## How standard attention works
+
+Standard attention materializes the full N×N matrix at each step:
+
+1. Compute `S = Q @ K^T` — write full N×N matrix to HBM
+2. Compute `P = softmax(S)` — read and write N×N matrix again
+3. Compute `O = P @ V` — read N×N matrix once more
+
+Every step involves a round-trip to HBM. At long sequence lengths this is dominated by memory bandwidth, not arithmetic throughput.
+
+## How FlashAttention tiles around SRAM
+
+FlashAttention splits Q, K, and V into blocks small enough to fit in SRAM, then fuses the softmax and both matrix multiplications into a single kernel pass:
+
+1. Load a block of Q into SRAM
+2. Loop over blocks of K and V, loading each into SRAM
+3. Accumulate the output directly, using online softmax to track running statistics
+4. Write only the final output O back to HBM — never the full attention matrix
+
+The full N×N attention matrix is never materialized in HBM at any point.
+
+## Online softmax
+
+The challenge with tiling softmax is that the standard formula requires knowing the row maximum across all N keys before you can normalize. FlashAttention solves this with an online algorithm that processes one block at a time while maintaining two running statistics per row:
+
+- `m`: the running row maximum seen so far
+- `l`: the running sum of exponentials (the softmax denominator)
+
+When a new block arrives, both statistics are updated and the partial output accumulated so far is rescaled. By the time all blocks are processed, the accumulated output is exactly equal to the full softmax result — no approximation.
+
+<Note>
+FlashAttention is **exact**, not approximate. The online softmax trick produces bit-for-bit identical results to standard attention (up to floating-point rounding order). "IO-aware" refers to the memory access pattern, not any trade-off in accuracy.
+</Note>
+
+## Arithmetic intensity
+
+The reason tiling works is arithmetic intensity: the ratio of FLOPs performed to HBM bytes accessed. Standard attention has low arithmetic intensity — it reads and writes large matrices repeatedly. FlashAttention keeps data in SRAM and performs many FLOPs per HBM byte, shifting the workload from memory-bound to compute-bound.
+
+On A100, FlashAttention reaches close to the theoretical peak of the tensor cores, whereas standard attention sits well below it at long sequence lengths.

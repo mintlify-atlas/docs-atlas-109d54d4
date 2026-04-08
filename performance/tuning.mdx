@@ -1,0 +1,95 @@
+---
+title: "Performance Tuning"
+description: "Environment variables and configuration options for maximizing FlashAttention throughput"
+---
+
+FlashAttention exposes several environment variables and API options to control build behavior, kernel selection, and runtime performance. This page covers the most useful settings for both NVIDIA CUDA and AMD ROCm targets.
+
+## Build-time variables
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `MAX_JOBS` | integer (e.g. `4`) | Limits parallel compilation jobs during `pip install`. Use this if you have less than 96 GB of RAM and many CPU cores — unconstrained parallel jobs can exhaust available memory. |
+
+Example:
+
+```sh
+MAX_JOBS=4 pip install flash-attn --no-build-isolation
+```
+
+## AMD Triton backend variables
+
+These variables apply when using the Triton backend on AMD GPUs (`FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"`).
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE` | `"TRUE"` | Enables autotuning to find the optimal kernel configuration for your workload. Incurs a one-time warmup cost on first use. |
+| `FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON` | JSON string | Overrides the default kernel configuration for `attn_fwd` with a single fixed config. Use when you know the best settings and want to skip autotuning. |
+
+When neither autotuning nor a config override is set, the Triton backend uses a default configuration optimized for determinism and reasonable performance across workloads.
+
+Example config override:
+
+```sh
+FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON='{"BLOCK_M":128,"BLOCK_N":64,"waves_per_eu":1,"PRE_LOAD_V":false,"num_stages":1,"num_warps":8}'
+```
+
+The JSON keys map to Triton kernel tile and scheduling parameters:
+
+| Key | Description |
+|-----|-------------|
+| `BLOCK_M` | Tile size along the query (M) dimension |
+| `BLOCK_N` | Tile size along the key/value (N) dimension |
+| `waves_per_eu` | Number of waves per execution unit |
+| `PRE_LOAD_V` | Whether to preload V tiles before computing attention scores |
+| `num_stages` | Number of pipeline stages |
+| `num_warps` | Number of warps per block |
+
+## FlashAttention-4 (FA4) variables
+
+FA4 uses CuTeDSL and compiles kernels at runtime. These variables control compilation, caching, and debugging behavior.
+
+| Variable | Values | Description |
+|----------|--------|-------------|
+| `FLASH_ATTENTION_ARCH` | e.g. `sm90`, `sm100` | Overrides the target GPU architecture for kernel compilation. |
+| `CUTE_DSL_ARCH` | e.g. `sm90`, `sm100` | Sets the CuTeDSL target architecture (used by the underlying DSL compiler). |
+| `FLASH_ATTENTION_FAKE_TENSOR` | `0`, `1` | When set to `1`, uses PyTorch `FakeTensorMode` to compile kernels without allocating GPU memory or executing them. Useful for parallel pre-compilation in CI or test environments. |
+| `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED` | `0`, `1` | Enables a persistent disk cache for compiled kernels at `/tmp/${USER}/flash_attention_cute_dsl_cache/`. Avoids recompilation across runs. |
+| `CUTE_CUBIN_PATH` | directory path | If set, compiled CUBIN (and SASS) files are dumped to this path for inspection. |
+| `CUTE_DSL_KEEP_PTX` | `1` | Retains generated PTX files for inspection rather than discarding them after compilation. |
+
+### Two-pass testing workflow
+
+The FA4 cache variables enable a fast two-pass test workflow that separates compilation from execution:
+
+```sh
+# Pass 1: compile all kernels in parallel (no GPU memory needed)
+FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -n 64 -x tests/cute/test_flash_attn.py
+
+# Pass 2: run tests using cached compiled kernels
+FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x tests/cute/test_flash_attn.py
+```
+
+This is especially useful on machines with many CPU cores but limited GPU memory.
+
+## API options
+
+### Deterministic backward pass
+
+```python
+flash_attn_func(q, k, v, deterministic=True)
+```
+
+Setting `deterministic=True` enables a deterministic backward pass. This is useful for debugging numerical issues and ensuring reproducibility. It is slightly slower and uses more memory than the default non-deterministic backward.
+
+The forward pass is always deterministic regardless of this flag.
+
+### Choosing between FA2 and FA4
+
+| Version | Best for | Notes |
+|---------|----------|-------|
+| FA2 | Ampere (A100), Ada (RTX 4090), most production use | Stable, widely supported, CUDA and ROCm |
+| FA3 | Hopper (H100, H800) | Additional speedup over FA2 on Hopper; beta release |
+| FA4 | Hopper (H100) and Blackwell (B200) | Fastest on newest hardware; CuTeDSL-based, runtime compilation |
+
+FA4 is faster than FA2 on Hopper and Blackwell architectures. FA2 remains the stable fallback for all other supported hardware and for production deployments that require a mature, well-tested implementation.

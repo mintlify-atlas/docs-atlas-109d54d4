@@ -1,0 +1,126 @@
+---
+title: "AMD ROCm"
+description: "Installing and using FlashAttention on AMD GPUs with ROCm"
+---
+
+FlashAttention supports AMD GPUs through two backends: the default [Composable Kernel](https://github.com/ROCm/composable_kernel) (CK) backend and an optional [Triton](https://github.com/triton-lang/triton) backend. Both implement FlashAttention-2.
+
+## Requirements
+
+- ROCm 6.0 or later
+- PyTorch for ROCm (use the [rocm/pytorch](https://hub.docker.com/r/rocm/pytorch) Docker image for a pre-configured environment)
+
+## Supported GPUs
+
+| Backend | Supported GPUs |
+| ------- | -------------- |
+| Composable Kernel (CK) | MI200x, MI250x, MI300x, MI355x, RDNA 3, RDNA 4 |
+| Triton | CDNA (MI200, MI300) and RDNA GPUs |
+
+## Composable Kernel backend
+
+The CK backend is the default and requires no extra environment variables.
+
+**Install:**
+
+```sh
+pip install flash-attn --no-build-isolation
+```
+
+**Supported features:**
+
+- Datatypes: `fp16`, `bf16`
+- Head dimensions up to 256
+- Forward and backward pass
+
+**GPU-specific limitations:**
+
+- RDNA 3 GPUs: forward pass only — backward pass is not supported
+- RDNA 4 GPUs: backward pass supported only with `deterministic=False`
+
+**Run CK backend tests:**
+
+```sh
+pytest tests/test_flash_attn_ck.py
+```
+
+## Triton backend
+
+The Triton backend is provided by the [aiter](https://github.com/ROCm/aiter) package, included as a git submodule at `third_party/aiter`.
+
+**Install:**
+
+First get PyTorch for ROCm from [pytorch.org](https://pytorch.org/get-started/locally/), then:
+
+```sh
+cd flash-attention
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
+```
+
+**Supported features:**
+
+- Datatypes: `fp16`, `bf16`, `fp32`
+- GPU architectures: CDNA (MI200, MI300) and RDNA
+- Causal masking
+- Variable sequence lengths (varlen)
+- Multi-query and grouped-query attention (MQA/GQA)
+- Dropout
+- Rotary embeddings
+- ALiBi
+- Paged attention
+- FP8 (via the FlashAttention v3 interface)
+
+**Run Triton backend tests** (note: the full suite takes several hours):
+
+```sh
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
+```
+
+### Autotuning
+
+The Triton backend uses a default kernel configuration optimized for determinism and broad performance. For peak throughput at the cost of a one-time warmup:
+
+```sh
+FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE" python your_script.py
+```
+
+### Custom kernel configuration
+
+To pin the forward kernel to a specific Triton config instead of autotuning, set `FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON`:
+
+```sh
+FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON='{"BLOCK_M":128,"BLOCK_N":64,"waves_per_eu":1,"PRE_LOAD_V":false,"num_stages":1,"num_warps":8}' \
+    python your_script.py
+```
+
+## Docker quickstart
+
+The following Dockerfile builds FlashAttention with the Triton backend on top of the official ROCm PyTorch image:
+
+```dockerfile
+FROM rocm/pytorch:latest
+
+WORKDIR /workspace
+
+# build flash attention with triton backend
+RUN git clone https://github.com/Dao-AILab/flash-attention && \
+    cd flash-attention && \
+    FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
+
+# set working dir
+WORKDIR /workspace/flash-attention
+
+# set env variable to use triton backend
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
+```
+
+Build the image and start a container:
+
+```sh
+docker build -t flash-attn-triton .
+docker run -it --network=host --user root --group-add video \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    --ipc=host --shm-size 16G \
+    --device=/dev/kfd --device=/dev/dri \
+    flash-attn-triton
+```

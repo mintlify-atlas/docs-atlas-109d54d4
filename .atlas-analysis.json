@@ -1,0 +1,115 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "FlashAttention",
+  "projectDescription": "A fast, memory-efficient exact attention library for PyTorch that achieves significant speedups over standard attention through IO-aware CUDA kernel design, supporting NVIDIA (Ampere, Hopper, Blackwell) and AMD ROCm GPUs.",
+  "theme": "aspen",
+  "primaryColor": "#912d37",
+  "lightColor": "#776f67",
+  "darkColor": "#d3cfcc",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/io-awareness",
+              "concepts/memory-efficiency",
+              "concepts/hardware-support"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/basic-attention",
+              "guides/variable-length",
+              "guides/kv-cache-inference",
+              "guides/advanced-features"
+            ]
+          },
+          {
+            "group": "Model Integration",
+            "pages": [
+              "integration/transformers",
+              "integration/training",
+              "integration/rocm"
+            ]
+          },
+          {
+            "group": "Performance",
+            "pages": [
+              "performance/benchmarks",
+              "performance/tuning"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "FlashAttention-2 API",
+            "pages": [
+              "api/flash-attn-func",
+              "api/flash-attn-varlen-func",
+              "api/flash-attn-with-kvcache"
+            ]
+          },
+          {
+            "group": "FlashAttention-4 API",
+            "pages": [
+              "api/fa4-flash-attn-func",
+              "api/fa4-flash-attn-varlen-func",
+              "api/advanced-modifiers"
+            ]
+          },
+          {
+            "group": "Layers & Modules",
+            "pages": [
+              "api/mha-module",
+              "api/layers"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "IO-aware tiling algorithm that avoids materialization of the NxN attention matrix",
+    "Linear memory complexity vs quadratic in standard attention",
+    "Support for causal masking, sliding window (local) attention, and ALiBi",
+    "Multi-query attention (MQA) and grouped-query attention (GQA) support",
+    "KV cache inference with paged attention (PagedAttention-compatible)",
+    "FP16 and BF16 support with FP8 forward on select architectures",
+    "FlashAttention-3 beta optimized for Hopper (H100) GPUs",
+    "FlashAttention-4 (CuTeDSL) for Hopper and Blackwell GPUs",
+    "AMD ROCm support via Composable Kernel (CK) and Triton backends",
+    "torch.compile() compatibility",
+    "Rotary embeddings, softcapping, deterministic backward pass",
+    "Flexible score_mod and mask_mod for custom attention patterns (FA4)"
+  ],
+  "publicApiSurface": [
+    "flash_attn_func(q, k, v, dropout_p, softmax_scale, causal, window_size, alibi_slopes, deterministic)",
+    "flash_attn_qkvpacked_func(qkv, dropout_p, softmax_scale, causal, window_size, alibi_slopes, deterministic)",
+    "flash_attn_kvpacked_func(q, kv, dropout_p, softmax_scale, causal, window_size, alibi_slopes, deterministic)",
+    "flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, ...)",
+    "flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, dropout_p, ...)",
+    "flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k, ...)",
+    "flash_attn_with_kvcache(q, k_cache, v_cache, k, v, rotary_cos, rotary_sin, cache_seqlens, ...)",
+    "flash_attn.cute.flash_attn_func(q, k, v, causal, window_size_left, window_size_right, score_mod, mask_mod, ...)",
+    "flash_attn.cute.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)",
+    "flash_attn_interface (FA3 Hopper): flash_attn_func, flash_attn_varlen_func",
+    "flash_attn.modules.mha.MHA",
+    "flash_attn.layers.rotary.RotaryEmbedding",
+    "flash_attn.layers.patch_embed.PatchEmbed"
+  ]
+}

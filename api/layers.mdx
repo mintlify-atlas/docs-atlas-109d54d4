@@ -1,0 +1,372 @@
+---
+title: "Layers"
+description: "Optimized layer implementations: RotaryEmbedding and PatchEmbed"
+---
+
+## RotaryEmbedding
+
+Implements Rotary Position Embedding (RoPE) from [RoFormer](https://arxiv.org/abs/2104.09864) (Su et al., 2021). Queries and keys are multiplied by position-dependent rotation matrices so that the attention score between two positions depends only on their **relative** offset — no additive positional embedding is added to the residual stream.
+
+When `scale_base` is set the module instead implements [XPos](https://arxiv.org/abs/2212.10554) (Sun et al., 2022), which further scales the rotation by a position-dependent factor to improve length extrapolation.
+
+```python
+from flash_attn.layers.rotary import RotaryEmbedding
+```
+
+### Constructor
+
+```python
+RotaryEmbedding(
+    dim,
+    base=10000.0,
+    interleaved=False,
+    scale_base=None,
+    device=None,
+)
+```
+
+<ParamField path="dim" type="int" required>
+  Dimensionality of the rotary embedding. Typically equal to `head_dim`
+  (full-rotation) or a fraction of it (partial-rotation). The rotation is
+  applied to the first `dim` features of each head; remaining features are left
+  unchanged.
+</ParamField>
+
+<ParamField path="base" type="float" default="10000.0">
+  Base value for the inverse-frequency computation:
+  `inv_freq = 1 / base^(2i / dim)`. Larger values spread frequency bands
+  further apart, extending effective context length. Common alternatives:
+  `500000.0` (Llama-3), `1000000.0` (Mistral-Nemo).
+</ParamField>
+
+<ParamField path="interleaved" type="bool" default="False">
+  Controls which pairs of dimensions are rotated together.
+
+  - `False` (default, GPT-NeoX style): rotates the first half and second half
+    of the `dim` features as a pair.
+  - `True` (GPT-J style): rotates pairs of consecutive even/odd dimensions.
+
+  Must match the convention used by the model checkpoint.
+</ParamField>
+
+<ParamField path="scale_base" type="float | None" default="None">
+  Enables **XPos** when set. A scale factor per position is computed and applied
+  to the rotation, which helps the model generalise to sequence lengths beyond
+  those seen during training. The authors recommend `512`. When `None`, standard
+  RoPE is used.
+</ParamField>
+
+<ParamField path="device" type="torch.device | str | None" default="None">
+  Device on which to pre-compute and cache the inverse-frequency buffer.
+</ParamField>
+
+### Forward Method
+
+```python
+RotaryEmbedding.forward(
+    qkv,
+    kv=None,
+    seqlen_offset=0,
+    max_seqlen=None,
+    num_heads_q=None,
+)
+```
+
+Applies rotary embeddings **in-place** to the query and key tensors.
+
+<ParamField path="qkv" type="Tensor" required>
+  Combined QKV tensor — **or** just Q when `kv` is also provided.
+
+  | Shape | Meaning |
+  |---|---|
+  | `(batch, seqlen, 3, nheads, headdim)` | Standard packed QKV (MHA) |
+  | `(batch, seqlen, num_heads_q + 2 * num_heads_k, headdim)` | GQA/MQA layout; requires `num_heads_q` |
+  | `(batch, seqlen, nheads, headdim)` | Q only, when `kv` is provided separately |
+</ParamField>
+
+<ParamField path="kv" type="Tensor | None" default="None">
+  Key-value tensor of shape `(batch, seqlen, 2, nheads_kv, headdim)`. When
+  provided, `qkv` is treated as Q alone and rotation is applied separately to Q
+  and K.
+</ParamField>
+
+<ParamField path="seqlen_offset" type="int | Tensor" default="0">
+  Position offset applied to every sequence. An `int` shifts all sequences by
+  the same amount (typical during generation when the KV cache already holds
+  `seqlen_offset` tokens). A `Tensor` of shape `(batch,)` allows per-sample
+  offsets. When a tensor is provided, `max_seqlen` must also be supplied so the
+  cos/sin cache can be pre-allocated to the correct length.
+</ParamField>
+
+<ParamField path="max_seqlen" type="int | None" default="None">
+  Forces the cos/sin cache to be built up to this length. Use when
+  `seqlen_offset` is a tensor (per-sample offsets) and the true maximum
+  sequence length is known in advance.
+</ParamField>
+
+<ParamField path="num_heads_q" type="int | None" default="None">
+  Number of query heads. Required when `qkv` uses the GQA/MQA layout
+  `(batch, seqlen, num_heads_q + 2 * num_heads_k, headdim)` so the module can
+  correctly split Q from K.
+</ParamField>
+
+#### Returns
+
+| `kv` argument | Return value |
+|---|---|
+| `None` | Modified `qkv` tensor (same shape as input, in-place) |
+| provided | Tuple `(q, kv)` — both modified in-place |
+
+### Usage Examples
+
+#### Standalone use with `flash_attn_func`
+
+```python
+import torch
+from flash_attn.layers.rotary import RotaryEmbedding
+from flash_attn import flash_attn_func
+
+HEAD_DIM = 128
+rotary = RotaryEmbedding(dim=HEAD_DIM).cuda()
+
+B, S, H = 2, 1024, 16
+q   = torch.randn(B, S, H, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+k   = torch.randn(B, S, H, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+v   = torch.randn(B, S, H, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+
+# Pack into qkv for the RotaryEmbedding forward
+qkv = torch.stack([q, k, v], dim=2)   # (B, S, 3, H, HEAD_DIM)
+qkv = rotary(qkv)                      # in-place rotation of Q and K
+
+out = flash_attn_func(qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2], causal=True)
+# out: (B, S, H, HEAD_DIM)
+```
+
+#### Separate Q and KV (GQA)
+
+```python
+rotary = RotaryEmbedding(dim=128).cuda()
+
+q  = torch.randn(2, 512, 32, 128, device="cuda", dtype=torch.bfloat16)  # 32 Q heads
+kv = torch.randn(2, 512, 2, 8, 128, device="cuda", dtype=torch.bfloat16)  # 8 KV heads
+
+q, kv = rotary(q, kv=kv)
+```
+
+#### KV-cache generation (seqlen offset)
+
+```python
+rotary = RotaryEmbedding(dim=128).cuda()
+
+# During decode step, positions already cached: 0..127
+q_new = torch.randn(2, 1, 16, 128, device="cuda", dtype=torch.bfloat16)
+kv_new = torch.randn(2, 1, 2, 16, 128, device="cuda", dtype=torch.bfloat16)
+
+qkv_new = torch.stack(
+    [q_new, kv_new[:, :, 0], kv_new[:, :, 1]], dim=2
+)
+qkv_new = rotary(qkv_new, seqlen_offset=128)  # position 128 applied to the new token
+```
+
+#### Integration with `flash_attn_with_kvcache`
+
+```python
+from flash_attn import flash_attn_with_kvcache
+
+rotary = RotaryEmbedding(dim=64, interleaved=False).cuda()
+
+# Pre-compute cos/sin up to max generation length
+rotary._update_cos_sin_cache(seqlen=2048, device="cuda", dtype=torch.bfloat16)
+cos, sin = rotary._cos_cached, rotary._sin_cached
+
+out = flash_attn_with_kvcache(
+    q=q_decode,
+    k_cache=k_cache,
+    v_cache=v_cache,
+    k=k_new,
+    v=v_new,
+    rotary_cos=cos,
+    rotary_sin=sin,
+    cache_seqlens=cache_seqlens,
+    causal=True,
+    rotary_interleaved=False,
+)
+```
+
+---
+
+## PatchEmbed
+
+Splits a 2-D image into non-overlapping patches and linearly projects each patch to an embedding vector — the standard first layer of Vision Transformer (ViT) models.
+
+Unlike the common Conv2d-based implementation (e.g. timm), `PatchEmbed` uses `nn.Linear` (optionally `FusedDense`) over a rearranged view of the input, which is approximately **8× faster** in practice.
+
+```python
+from flash_attn.layers.patch_embed import PatchEmbed
+```
+
+### Constructor
+
+```python
+PatchEmbed(
+    img_size=224,
+    patch_size=16,
+    in_chans=3,
+    embed_dim=768,
+    norm_layer=None,
+    flatten=True,
+    bias=True,
+    fused_bias_fc=False,
+)
+```
+
+<ParamField path="img_size" type="int | tuple[int, int]" default="224">
+  Expected spatial resolution of the input image. An integer is treated as a
+  square; a tuple `(H, W)` allows rectangular images. The forward pass asserts
+  that the input matches this size exactly.
+</ParamField>
+
+<ParamField path="patch_size" type="int | tuple[int, int]" default="16">
+  Size of each patch in pixels. An integer is treated as square patches; a
+  tuple allows non-square patches. `img_size` must be divisible by `patch_size`
+  in each dimension.
+</ParamField>
+
+<ParamField path="in_chans" type="int" default="3">
+  Number of input image channels (e.g. `3` for RGB, `1` for grayscale).
+</ParamField>
+
+<ParamField path="embed_dim" type="int" default="768">
+  Output embedding dimension per patch. This is also the model's hidden
+  dimension (`d_model`).
+</ParamField>
+
+<ParamField path="norm_layer" type="callable | None" default="None">
+  A callable that takes `embed_dim` and returns a normalisation module
+  (e.g. `nn.LayerNorm`). Applied to patch embeddings after the linear
+  projection. When `None`, an `nn.Identity` is used (no normalisation).
+</ParamField>
+
+<ParamField path="flatten" type="bool" default="True">
+  When `True` (default), the spatial grid of patches is flattened into a single
+  sequence dimension: output shape `(B, num_patches, embed_dim)`. When `False`,
+  the 2-D grid is preserved: output shape `(B, grid_H, grid_W, embed_dim)`.
+</ParamField>
+
+<ParamField path="bias" type="bool" default="True">
+  Whether the projection linear layer includes a bias term.
+</ParamField>
+
+<ParamField path="fused_bias_fc" type="bool" default="False">
+  When `True` **and** `bias=True`, uses `FusedDense` from
+  `flash_attn.ops.fused_dense` for the projection, which fuses the bias add into
+  the GEMM for additional efficiency. Raises `ImportError` if `fused_dense` is
+  not installed.
+</ParamField>
+
+### Forward Method
+
+```python
+PatchEmbed.forward(x)
+```
+
+<ParamField path="x" type="Tensor" required>
+  Input image batch of shape `(B, C, H, W)`. `H` and `W` must equal the
+  `img_size` values given at construction. `C` must equal `in_chans`.
+</ParamField>
+
+#### Returns
+
+| `flatten` | Output shape |
+|---|---|
+| `True` (default) | `(B, num_patches, embed_dim)` where `num_patches = (H / patch_H) * (W / patch_W)` |
+| `False` | `(B, grid_H, grid_W, embed_dim)` |
+
+### Computed Attributes
+
+| Attribute | Type | Description |
+|---|---|---|
+| `img_size` | `tuple[int, int]` | Resolved `(H, W)` of the expected input image |
+| `patch_size` | `tuple[int, int]` | Resolved `(pH, pW)` of each patch |
+| `grid_size` | `tuple[int, int]` | Number of patches along each axis: `(H // pH, W // pW)` |
+| `num_patches` | `int` | Total number of patches: `grid_size[0] * grid_size[1]` |
+
+### Implementation Note
+
+The projection avoids the Conv2d entirely. The input is rearranged from
+`(B, C, H, W)` → `(B, grid_H, grid_W, C·pH·pW)` using `einops.rearrange`,
+and then a single `nn.Linear` (or `FusedDense`) maps the flattened patch pixels
+to `embed_dim`. This is mathematically equivalent to the Conv2d approach but
+exploits highly optimised GEMM kernels, leading to substantially higher
+throughput.
+
+### Usage Examples
+
+#### Standard ViT patch embedding
+
+```python
+import torch
+from flash_attn.layers.patch_embed import PatchEmbed
+
+patch_embed = PatchEmbed(
+    img_size=224,
+    patch_size=16,
+    in_chans=3,
+    embed_dim=768,
+).cuda().to(torch.float16)
+
+images = torch.randn(8, 3, 224, 224, device="cuda", dtype=torch.float16)
+tokens = patch_embed(images)   # (8, 196, 768)
+# 196 = (224/16) * (224/16) = 14 * 14 patches
+```
+
+#### Fused projection for higher throughput
+
+```python
+patch_embed = PatchEmbed(
+    img_size=224,
+    patch_size=16,
+    in_chans=3,
+    embed_dim=768,
+    fused_bias_fc=True,   # requires flash_attn[fused_dense]
+    bias=True,
+).cuda().to(torch.bfloat16)
+
+images = torch.randn(16, 3, 224, 224, device="cuda", dtype=torch.bfloat16)
+tokens = patch_embed(images)   # (16, 196, 768)
+```
+
+#### With layer normalisation and non-square images
+
+```python
+import torch.nn as nn
+
+patch_embed = PatchEmbed(
+    img_size=(256, 384),    # landscape images
+    patch_size=32,
+    in_chans=3,
+    embed_dim=1024,
+    norm_layer=nn.LayerNorm,
+    flatten=True,
+).cuda()
+
+images = torch.randn(4, 3, 256, 384, device="cuda")
+tokens = patch_embed(images)
+# grid: (256/32) * (384/32) = 8 * 12 = 96 patches
+# tokens: (4, 96, 1024)
+print(patch_embed.num_patches)   # 96
+```
+
+#### Preserve spatial grid (flatten=False)
+
+```python
+patch_embed = PatchEmbed(
+    img_size=224,
+    patch_size=16,
+    embed_dim=768,
+    flatten=False,
+).cuda()
+
+images = torch.randn(2, 3, 224, 224, device="cuda")
+grid = patch_embed(images)   # (2, 14, 14, 768) — spatial layout preserved
+```

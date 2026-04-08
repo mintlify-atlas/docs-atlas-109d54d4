@@ -1,0 +1,206 @@
+---
+title: "Basic Attention"
+description: "Using flash_attn_func and flash_attn_qkvpacked_func for standard attention computation"
+---
+
+FlashAttention implements scaled dot-product attention: `softmax(Q @ K^T * softmax_scale) @ V`. The three main entry points for standard (non-variable-length) batches are `flash_attn_func`, `flash_attn_qkvpacked_func`, and `flash_attn_kvpacked_func`.
+
+## flash_attn_func
+
+The most general function. Accepts Q, K, V as separate tensors and supports GQA/MQA by allowing K and V to have fewer heads than Q.
+
+```python
+from flash_attn import flash_attn_func
+
+out = flash_attn_func(
+    q, k, v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+)
+```
+
+**Tensor shapes:**
+
+| Tensor | Shape |
+| ------ | ----- |
+| `q`    | `(batch_size, seqlen, nheads, headdim)` |
+| `k`    | `(batch_size, seqlen, nheads_k, headdim)` |
+| `v`    | `(batch_size, seqlen, nheads_k, headdim)` |
+| output | `(batch_size, seqlen, nheads, headdim)` |
+
+**Basic example:**
+
+```python
+import torch
+from flash_attn import flash_attn_func
+
+batch_size, seqlen, nheads, headdim = 2, 1024, 16, 64
+
+q = torch.randn(batch_size, seqlen, nheads, headdim, device="cuda", dtype=torch.float16)
+k = torch.randn(batch_size, seqlen, nheads, headdim, device="cuda", dtype=torch.float16)
+v = torch.randn(batch_size, seqlen, nheads, headdim, device="cuda", dtype=torch.float16)
+
+out = flash_attn_func(q, k, v)
+# out: (2, 1024, 16, 64)
+```
+
+## flash_attn_qkvpacked_func
+
+Use this function when Q, K, V are already stacked into a single tensor. The backward pass avoids explicitly concatenating gradients for Q, K, V, making it faster for training.
+
+```python
+from flash_attn import flash_attn_qkvpacked_func
+
+out = flash_attn_qkvpacked_func(
+    qkv,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+)
+```
+
+**Tensor shape:** `qkv` must be `(batch_size, seqlen, 3, nheads, headdim)`.
+
+```python
+import torch
+from flash_attn import flash_attn_qkvpacked_func
+
+batch_size, seqlen, nheads, headdim = 2, 1024, 16, 64
+
+qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device="cuda", dtype=torch.float16)
+
+out = flash_attn_qkvpacked_func(qkv)
+# out: (2, 1024, 16, 64)
+```
+
+<Note>
+  `flash_attn_qkvpacked_func` does not support GQA/MQA because Q, K, V must
+  share the same head count. Use `flash_attn_kvpacked_func` or `flash_attn_func`
+  for grouped-query attention.
+</Note>
+
+## flash_attn_kvpacked_func
+
+Use this function when K and V are already stacked, but Q is separate. Supports GQA/MQA.
+
+```python
+from flash_attn import flash_attn_kvpacked_func
+
+out = flash_attn_kvpacked_func(
+    q, kv,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+)
+```
+
+**Tensor shapes:**
+
+| Tensor | Shape |
+| ------ | ----- |
+| `q`    | `(batch_size, seqlen, nheads, headdim)` |
+| `kv`   | `(batch_size, seqlen, 2, nheads_k, headdim)` |
+| output | `(batch_size, seqlen, nheads, headdim)` |
+
+```python
+import torch
+from flash_attn import flash_attn_kvpacked_func
+
+batch_size, seqlen, nheads, nheads_k, headdim = 2, 1024, 32, 8, 64
+
+q  = torch.randn(batch_size, seqlen, nheads,   headdim, device="cuda", dtype=torch.float16)
+kv = torch.randn(batch_size, seqlen, 2, nheads_k, headdim, device="cuda", dtype=torch.float16)
+
+out = flash_attn_kvpacked_func(q, kv)
+# out: (2, 1024, 32, 64)
+```
+
+## Causal masking
+
+Pass `causal=True` to apply an auto-regressive causal mask. Each query position can only attend to key positions at or before it. The mask is aligned to the bottom-right corner of the attention matrix when `seqlen_q != seqlen_k`.
+
+```python
+out = flash_attn_func(q, k, v, causal=True)
+```
+
+## Sliding window (local) attention
+
+Set `window_size=(left, right)` to restrict each query to attend only to keys within a local window. Use `-1` for an unbounded side.
+
+```python
+# One-sided: query i attends to keys [i - 512, i] (causal-style local)
+out = flash_attn_func(q, k, v, window_size=(512, 0))
+
+# Symmetric: query i attends to keys [i - 256, i + 256]
+out = flash_attn_func(q, k, v, window_size=(256, 256))
+
+# Full context on the left, no look-ahead (equivalent to causal)
+out = flash_attn_func(q, k, v, window_size=(-1, 0))
+```
+
+## dropout_p
+
+`dropout_p` sets the probability of dropping attention weights during training.
+
+<Tip>
+  Always set `dropout_p=0.0` during evaluation and inference. Non-zero dropout
+  requires maintaining an RNG state and incurs extra overhead.
+</Tip>
+
+```python
+# Training
+out = flash_attn_func(q, k, v, dropout_p=0.1)
+
+# Evaluation
+model.eval()
+with torch.no_grad():
+    out = flash_attn_func(q, k, v, dropout_p=0.0)
+```
+
+## softmax_scale
+
+The scale applied to `QK^T` before the softmax. Defaults to `1 / sqrt(headdim)`. Override it when you need a custom temperature.
+
+```python
+import math
+
+headdim = 64
+custom_scale = 1.0 / math.sqrt(headdim)  # same as default
+
+# Use a lower temperature (sharper attention)
+out = flash_attn_func(q, k, v, softmax_scale=custom_scale * 0.5)
+```
+
+## Grouped-Query Attention (GQA)
+
+`flash_attn_func` and `flash_attn_kvpacked_func` support GQA/MQA: pass K and V with fewer heads than Q. The number of Q heads must be divisible by the number of K/V heads.
+
+For example, with 32 Q heads and 8 K/V heads, every 4 consecutive Q heads share one K/V head (heads 0–3 attend to KV head 0, heads 4–7 attend to KV head 1, and so on).
+
+```python
+import torch
+from flash_attn import flash_attn_func
+
+batch_size, seqlen, headdim = 2, 1024, 128
+nheads_q = 32   # query heads
+nheads_k = 8    # key/value heads — must divide nheads_q evenly
+
+assert nheads_q % nheads_k == 0, "nheads_q must be divisible by nheads_k"
+
+q = torch.randn(batch_size, seqlen, nheads_q, headdim, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(batch_size, seqlen, nheads_k, headdim, device="cuda", dtype=torch.bfloat16)
+v = torch.randn(batch_size, seqlen, nheads_k, headdim, device="cuda", dtype=torch.bfloat16)
+
+out = flash_attn_func(q, k, v, causal=True)
+# out: (2, 1024, 32, 128)
+```

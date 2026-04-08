@@ -1,0 +1,202 @@
+---
+title: "Score & Mask Modifiers"
+description: "Custom attention patterns using score_mod and mask_mod in FlashAttention-4"
+---
+
+FlashAttention-4 lets you inject custom per-element logic into the attention kernel at JIT compile time. Two extension points are available:
+
+- **`score_mod`** — modifies the raw attention score before the softmax (add biases, rescale, etc.)
+- **`mask_mod`** — computes a boolean mask that decides which token pairs are attended to
+
+Both must be decorated with `@cute.jit` from the `cutlass.cute` package. The decorator compiles the function to PTX/CUBIN and injects it into the kernel. Each unique modifier produces a distinct compiled kernel, identified by a hash of the callable's source.
+
+<Note>
+  `score_mod` and `mask_mod` are FA4-only features. They have no equivalent in FA2.
+</Note>
+
+## score_mod
+
+`score_mod` is called once per attention score element and must return a modified score of the same shape.
+
+### Signature
+
+```python
+@cute.jit
+def my_score_mod(
+    score,        # cute.TensorSSA — the raw attention score (float32)
+    b_idx,        # batch index
+    h_idx,        # head index
+    q_idx,        # query token index (within the current sequence)
+    kv_idx,       # key/value token index (within the current sequence)
+    seqlen_info,  # sequence metadata (offsets, lengths)
+    aux_tensors,  # list of additional tensors passed via aux_tensors=
+) -> cute.TensorSSA:  # modified score
+    ...
+```
+
+`score`, `b_idx`, `h_idx`, `q_idx`, and `kv_idx` are `TensorSSA` values — they may represent a vector of positions processed in parallel (vectorized path) or a single scalar. Use `q_idx[0]` / `kv_idx[0]` when you need a scalar to index into a tensor.
+
+For variable-length sequences, `seqlen_info.offset_q` and `seqlen_info.offset_k` give the packed-buffer start offset of the current sequence. Use these to compute global token positions:
+
+```python
+q_global  = q_idx  + seqlen_info.offset_q
+kv_global = kv_idx + seqlen_info.offset_k
+```
+
+### Examples
+
+**ALiBi positional bias:**
+
+```python
+import cutlass
+import cutlass.cute as cute
+from cutlass._mlir.dialects import math as mlir_math
+
+@cute.jit
+def alibi_score_mod(score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    # Slope = 2^(-8 * (h + 1) / num_heads)  (simplified for num_heads=8)
+    slope_exp = (h_idx + cute.full_like(h_idx, 1)) * cute.full_like(h_idx, -8)
+    slope = cute.math.exp2(
+        slope_exp.to(cutlass.Float32) * cute.full_like(score, 0.125 * 0.693 * 1.443)
+    )
+    diff = q_idx - kv_idx
+    abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype).to(cutlass.Float32)
+    return score - slope * abs_diff
+```
+
+**Per-batch learned bias (using `aux_tensors`):**
+
+```python
+@cute.jit
+def batch_bias_score_mod(score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    batch_bias = aux_tensors[0]          # shape: (batch,)
+    frag = cute.make_fragment(1, batch_bias.element_type)
+    frag[0] = batch_bias[b_idx[0]]
+    return score + frag.load().to(cutlass.Float32)
+
+# Pass bias tensor at call time:
+bias = torch.randn(batch, device="cuda", dtype=torch.bfloat16)
+out, _ = flash_attn_varlen_func(
+    q, k, v, cu_seqlens_q, cu_seqlens_k,
+    score_mod=batch_bias_score_mod,
+    aux_tensors=[bias],
+)
+```
+
+### Usage
+
+Pass `score_mod` to [`flash_attn_varlen_func`](/api/fa4-flash-attn-varlen-func):
+
+```python
+from flash_attn.cute import flash_attn_varlen_func
+
+out, _ = flash_attn_varlen_func(
+    q, k, v,
+    cu_seqlens_q=cu_seqlens_q,
+    cu_seqlens_k=cu_seqlens_k,
+    score_mod=alibi_score_mod,
+)
+```
+
+<Note>
+  `softcap` and `score_mod` cannot be used at the same time. Internally, `softcap` is implemented as a `score_mod`.
+</Note>
+
+---
+
+## mask_mod
+
+`mask_mod` computes a per-token-pair boolean mask. Returning `True` keeps the pair; returning `False` masks it out (treated as `-inf` before the softmax). Use this when you need a custom attention pattern that cannot be expressed as a causal flag or sliding window.
+
+### Signature
+
+```python
+@cute.jit
+def my_mask_mod(
+    batch,        # cute.TensorSSA — batch index
+    head,         # cute.TensorSSA — head index
+    m_idx,        # cute.TensorSSA — query position
+    n_idx,        # cute.TensorSSA — key/value position
+    seqlen_info,  # sequence metadata
+    aux_tensors,  # additional tensors
+) -> cute.TensorSSA:  # boolean mask (True = keep)
+    ...
+```
+
+### Examples
+
+**Prefix-LM mask** (bidirectional prefix, causal suffix):
+
+```python
+from flash_attn.cute import utils
+import cutlass
+import cutlass.cute as cute
+
+@cute.jit
+def prefix_lm_mask(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
+    prefix_size = utils.scalar_to_ssa(512, cutlass.Int32)
+    both_in_prefix = (m_idx < prefix_size) & (n_idx < prefix_size)
+    causal_part    = m_idx >= n_idx
+    return both_in_prefix | causal_part
+```
+
+**Block-diagonal mask** (each 128-token block attends only to itself):
+
+```python
+@cute.jit
+def block_diagonal_mask(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
+    block_size = utils.scalar_to_ssa(128, cutlass.Int32)
+    return (m_idx // block_size) == (n_idx // block_size)
+```
+
+### Usage
+
+Pass `mask_mod` to [`flash_attn_func`](/api/fa4-flash-attn-func):
+
+```python
+from flash_attn.cute import flash_attn_func
+
+out, _ = flash_attn_func(q, k, v, mask_mod=prefix_lm_mask)
+```
+
+<Warning>
+  `mask_mod` is not yet supported with variable-length sequences (`flash_attn_varlen_func`). Use `score_mod` with explicit `-inf` masking as a workaround.
+</Warning>
+
+When `mask_mod` is provided, the `causal`, `window_size_left`, and `window_size_right` arguments are ignored — the mask function is the sole authority on which token pairs are attended to.
+
+---
+
+## block_sparse_tensors
+
+For sparse attention patterns with a fixed block structure, you can pre-compute which KV blocks each Q tile attends to and pass them as index tensors. This skips entire blocks of KV tokens at the tile scheduler level, providing better performance than `mask_mod` for highly sparse patterns.
+
+The `BlockSparseTensorsTorch` named tuple holds four tensors:
+
+| Field | Shape | Description |
+|---|---|---|
+| `mask_block_cnt` | `(batch, heads_kv, num_q_blocks)` | Number of partially-attended KV blocks per Q tile |
+| `mask_block_idx` | `(batch, heads_kv, num_q_blocks, max_mask_blocks)` | Indices of those KV blocks |
+| `full_block_cnt` | `(batch, heads_kv, num_q_blocks)` or `None` | Number of fully-attended KV blocks per Q tile |
+| `full_block_idx` | `(batch, heads_kv, num_q_blocks, max_full_blocks)` or `None` | Indices of those KV blocks |
+
+All dimensions support broadcasting: a size-1 batch or head dimension is expanded automatically.
+
+Pass the tensors directly to [`flash_attn_func`](/api/fa4-flash-attn-func) via the individual fields:
+
+```python
+from flash_attn.cute import flash_attn_func
+
+out, _ = flash_attn_func(
+    q, k, v,
+    mask_block_cnt=my_bst.mask_block_cnt,
+    mask_block_idx=my_bst.mask_block_idx,
+    full_block_cnt=my_bst.full_block_cnt,
+    full_block_idx=my_bst.full_block_idx,
+    block_size=(128, 128),  # (q_block_size, kv_block_size)
+)
+```
+
+<Note>
+  Block-sparse attention is not yet supported with variable-length sequences or with `num_splits > 1`.
+</Note>

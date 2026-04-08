@@ -1,0 +1,182 @@
+---
+title: "flash_attn_func (FA4)"
+description: "FlashAttention-4 standard attention function using CuTeDSL — optimized for Hopper and Blackwell GPUs"
+---
+
+FlashAttention-4 (`flash-attn-4`) is a separate package from FlashAttention-2 (`flash-attn`). Both can be installed and imported simultaneously — they do not conflict.
+
+```bash
+pip install flash-attn-4
+
+# On CUDA 13, add the cu13 extra for best performance:
+pip install "flash-attn-4[cu13]"
+```
+
+```python
+from flash_attn.cute import flash_attn_func
+```
+
+`flash_attn_func` computes scaled dot-product attention: `softmax(Q @ K^T * softmax_scale) @ V`. It is a `torch.autograd.Function` and supports backpropagation.
+
+## Supported features
+
+- Dtypes: BF16 and FP16
+- Attention patterns: non-causal, causal, sliding window (local)
+- Head configurations: MHA, GQA, MQA
+- Head dimensions: 64, 96, 128 (SM90/SM80); additionally `(hdim_qk=192, hdim_v=128)` on Blackwell (DeepSeek shape)
+- Variable-length sequences: via [`flash_attn_varlen_func`](/api/fa4-flash-attn-varlen-func)
+- Score and mask modifiers: custom `@cute.jit` callables — see [Score & Mask Modifiers](/api/advanced-modifiers)
+- Block-sparse attention patterns
+
+## Not yet supported
+
+- FlashDecoding (split-KV) — `num_splits > 1` is available on Blackwell (SM100/SM110) only
+- Paged KV cache — Blackwell only
+- FP8
+- Optimized Hopper/Blackwell backward pass (Ampere backward runs on all architectures but is slower)
+- `mask_mod` with variable-length sequences
+
+## Signature
+
+```python
+flash_attn_func(
+    q,
+    k,
+    v,
+    softmax_scale=None,
+    causal=False,
+    window_size=(None, None),
+    learnable_sink=None,
+    softcap=0.0,
+    num_splits=1,
+    pack_gqa=None,
+    deterministic=False,
+    mask_mod=None,
+    full_block_cnt=None,
+    full_block_idx=None,
+    mask_block_cnt=None,
+    mask_block_idx=None,
+    block_size=None,
+    return_lse=False,
+)
+```
+
+## Parameters
+
+### Core inputs
+
+<ParamField body="q" type="torch.Tensor" required>
+  Query tensor of shape `(batch, seqlen_q, num_heads, head_dim)`. Must be BF16 or FP16, on a CUDA device, and contiguous in the last dimension (16-byte aligned).
+</ParamField>
+
+<ParamField body="k" type="torch.Tensor" required>
+  Key tensor of shape `(batch, seqlen_k, num_heads_kv, head_dim)`. Same dtype and device as `q`. For GQA/MQA, `num_heads` must be divisible by `num_heads_kv`.
+</ParamField>
+
+<ParamField body="v" type="torch.Tensor" required>
+  Value tensor of shape `(batch, seqlen_k, num_heads_kv, head_dim_v)`. `head_dim_v` may differ from `head_dim` for the DeepSeek shape `(192, 128)` on Blackwell.
+</ParamField>
+
+### Attention options
+
+<ParamField body="softmax_scale" type="float" default="1 / sqrt(head_dim)">
+  Scaling factor applied to `Q @ K^T` before the softmax. Defaults to `1 / sqrt(head_dim)`.
+</ParamField>
+
+<ParamField body="causal" type="bool" default="false">
+  Apply a causal (autoregressive) mask. Equivalent to `window_size=(None, 0)`.
+</ParamField>
+
+<ParamField body="window_size" type="tuple[int | None, int | None]" default="(None, None)">
+  `(left, right)` token counts for sliding window (local) attention. `None` means no limit on that side. For example, `(512, 0)` makes each query attend to the 512 preceding keys plus itself (causal sliding window). Setting `causal=True` overrides `window_size[1]` to `0`.
+</ParamField>
+
+<ParamField body="softcap" type="float" default="0.0">
+  Applies logit softcapping: `score = tanh(score / softcap) * softcap` before the softmax. Set to `0.0` to disable. Cannot be used together with `mask_mod`.
+</ParamField>
+
+### GQA / performance
+
+<ParamField body="pack_gqa" type="bool | None" default="None">
+  Pack multiple Q heads per KV head into a single warp group for more efficient GQA. Defaults to `True` when `num_heads > num_heads_kv`. Disable if you encounter correctness issues with block-sparse + GQA.
+</ParamField>
+
+<ParamField body="num_splits" type="int" default="1">
+  Number of KV splits (FlashDecoding). Only supported on Blackwell (SM100/SM110). Pass `0` to let the runtime choose automatically using a built-in heuristic.
+</ParamField>
+
+<ParamField body="deterministic" type="bool" default="false">
+  Use the deterministic backward pass. Slightly slower but produces bit-identical gradients across runs.
+</ParamField>
+
+### Custom attention patterns
+
+<ParamField body="mask_mod" type="Callable | None" default="None">
+  A `@cute.jit`-decorated callable that computes a boolean mask per token pair. `True` means keep; `False` means mask out. Injected at JIT compile time. See [Score & Mask Modifiers](/api/advanced-modifiers).
+
+  Signature: `mask_mod(batch, head, m_idx, n_idx, seqlen_info, aux_tensors) -> bool`
+</ParamField>
+
+<ParamField body="full_block_cnt" type="torch.Tensor | None" default="None">
+  Per-tile count of fully-attended (dense) KV blocks, for block-sparse attention. Shape `(batch, num_heads_kv, num_m_blocks)` or broadcastable. Requires `full_block_idx`.
+</ParamField>
+
+<ParamField body="full_block_idx" type="torch.Tensor | None" default="None">
+  Indices of fully-attended KV blocks. Shape `(batch, num_heads_kv, num_m_blocks, max_full_blocks)`.
+</ParamField>
+
+<ParamField body="mask_block_cnt" type="torch.Tensor | None" default="None">
+  Per-tile count of partially-attended (masked) KV blocks. Shape `(batch, num_heads_kv, num_m_blocks)`.
+</ParamField>
+
+<ParamField body="mask_block_idx" type="torch.Tensor | None" default="None">
+  Indices of partially-attended KV blocks. Shape `(batch, num_heads_kv, num_m_blocks, max_mask_blocks)`.
+</ParamField>
+
+<ParamField body="block_size" type="tuple[int, int] | None" default="None">
+  `(q_block_size, kv_block_size)` used when constructing the block-sparse tensors above. Required when the block size does not evenly divide the sequence length.
+</ParamField>
+
+### Outputs
+
+<ParamField body="return_lse" type="bool" default="false">
+  Also return the log-sum-exp (LSE) of each row's attention scores. The LSE tensor supports gradients and is required when combining splits or implementing custom backward passes.
+</ParamField>
+
+### Learnable sink
+
+<ParamField body="learnable_sink" type="torch.Tensor | None" default="None">
+  Per-head learnable sink token bias. Shape `(num_heads,)`, dtype BF16. Adds a fixed attended position to every query; used in StreamingLLM-style attention.
+</ParamField>
+
+## Return value
+
+<ResponseField name="out" type="torch.Tensor">
+  Attention output of shape `(batch, seqlen_q, num_heads, head_dim_v)`, same dtype as `q`.
+</ResponseField>
+
+<ResponseField name="lse" type="torch.Tensor | None">
+  Log-sum-exp tensor of shape `(batch, num_heads, seqlen_q)`, dtype `float32`. Only allocated when `return_lse=True` or when any input requires a gradient.
+</ResponseField>
+
+## Example
+
+```python
+import torch
+from flash_attn.cute import flash_attn_func
+
+batch, seqlen, nheads, nheads_kv, headdim = 2, 2048, 32, 8, 128
+
+q = torch.randn(batch, seqlen, nheads,    headdim, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(batch, seqlen, nheads_kv, headdim, device="cuda", dtype=torch.bfloat16)
+v = torch.randn(batch, seqlen, nheads_kv, headdim, device="cuda", dtype=torch.bfloat16)
+
+# Causal GQA (32 Q heads, 8 KV heads)
+out, _ = flash_attn_func(q, k, v, causal=True)
+
+# Sliding window: attend to 512 past tokens + self
+out, _ = flash_attn_func(q, k, v, window_size=(512, 0))
+
+# Return LSE for use in custom loss or split-KV combining
+out, lse = flash_attn_func(q, k, v, causal=True, return_lse=True)
+```

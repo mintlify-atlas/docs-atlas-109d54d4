@@ -1,0 +1,189 @@
+---
+title: "KV Cache Inference"
+description: "Efficient incremental decoding with flash_attn_with_kvcache"
+---
+
+`flash_attn_with_kvcache` is optimized for auto-regressive inference. It accepts a pre-allocated KV cache from previous decoding steps, writes new keys and values into it in-place, and runs attention — all in a single CUDA kernel.
+
+<Note>
+  This function does not support a backward pass. It is designed exclusively
+  for inference.
+</Note>
+
+## Function signature
+
+```python
+from flash_attn import flash_attn_with_kvcache
+
+out = flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens=None,
+    cache_batch_idx=None,
+    block_table=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    rotary_interleaved=True,
+    alibi_slopes=None,
+)
+```
+
+## How incremental decoding works
+
+At each decoding step you pass:
+
+1. **`q`** — the query for the new token(s): `(batch_size, seqlen_new, nheads, headdim)`
+2. **`k_cache` / `v_cache`** — the pre-allocated cache tensors. The kernel writes `k` and `v` into them starting at `cache_seqlens[i]` for each batch element `i`.
+3. **`k` / `v`** *(optional)* — new key/value tokens to append. If `None`, the cache is used as-is (read-only).
+4. **`cache_seqlens`** — a `(batch_size,)` int32 tensor tracking how many tokens are already in the cache for each sequence.
+
+The cache update and attention computation happen in a single kernel, avoiding separate memory round-trips.
+
+## Tensor shapes
+
+| Argument | Shape | Notes |
+| -------- | ----- | ----- |
+| `q` | `(batch_size, seqlen_new, nheads, headdim)` | Query for current step |
+| `k_cache` | `(batch_size_cache, seqlen_cache, nheads_k, headdim)` | Pre-allocated; updated in-place |
+| `v_cache` | `(batch_size_cache, seqlen_cache, nheads_k, headdim)` | Pre-allocated; updated in-place |
+| `k` | `(batch_size, seqlen_new, nheads_k, headdim)` | New keys to write into cache |
+| `v` | `(batch_size, seqlen_new, nheads_k, headdim)` | New values to write into cache |
+| `cache_seqlens` | `(batch_size,)` int32 | Current lengths in cache per sequence |
+| output | `(batch_size, seqlen_new, nheads, headdim)` | Attention output |
+
+`k_cache` and `v_cache` must have a contiguous last dimension (`stride(-1) == 1`).
+
+## Basic example: single-token decoding
+
+```python
+import torch
+from flash_attn import flash_attn_with_kvcache
+
+device = "cuda"
+dtype  = torch.float16
+
+batch_size  = 4
+max_seqlen  = 2048   # maximum context length
+nheads      = 32
+nheads_k    = 8      # GQA: 4 Q heads per KV head
+headdim     = 128
+
+# Pre-allocate the KV cache once (filled with zeros)
+k_cache = torch.zeros(batch_size, max_seqlen, nheads_k, headdim, device=device, dtype=dtype)
+v_cache = torch.zeros(batch_size, max_seqlen, nheads_k, headdim, device=device, dtype=dtype)
+
+# Track how many tokens are cached per sequence
+cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+# --- Step 1: prefill with a prompt of length 32 ---
+seqlen_prompt = 32
+q_prefill = torch.randn(batch_size, seqlen_prompt, nheads,   headdim, device=device, dtype=dtype)
+k_prefill = torch.randn(batch_size, seqlen_prompt, nheads_k, headdim, device=device, dtype=dtype)
+v_prefill = torch.randn(batch_size, seqlen_prompt, nheads_k, headdim, device=device, dtype=dtype)
+
+out_prefill = flash_attn_with_kvcache(
+    q_prefill, k_cache, v_cache,
+    k=k_prefill, v=v_prefill,
+    cache_seqlens=cache_seqlens,
+    causal=True,
+)
+cache_seqlens += seqlen_prompt
+# out_prefill: (4, 32, 32, 128)
+
+# --- Step 2: decode one token ---
+q_decode = torch.randn(batch_size, 1, nheads,   headdim, device=device, dtype=dtype)
+k_decode = torch.randn(batch_size, 1, nheads_k, headdim, device=device, dtype=dtype)
+v_decode = torch.randn(batch_size, 1, nheads_k, headdim, device=device, dtype=dtype)
+
+out_decode = flash_attn_with_kvcache(
+    q_decode, k_cache, v_cache,
+    k=k_decode, v=v_decode,
+    cache_seqlens=cache_seqlens,
+    causal=True,
+)
+cache_seqlens += 1
+# out_decode: (4, 1, 32, 128)
+```
+
+## Rotary embeddings
+
+Pass `rotary_cos` and `rotary_sin` to apply rotary positional embeddings inside the kernel. This is more efficient than pre-applying them before calling the function.
+
+```python
+rotary_dim = 64  # must be divisible by 16
+seqlen_ro  = max_seqlen
+
+# Precompute once
+rotary_cos = torch.randn(seqlen_ro, rotary_dim // 2, device=device, dtype=torch.float32)
+rotary_sin = torch.randn(seqlen_ro, rotary_dim // 2, device=device, dtype=torch.float32)
+
+out = flash_attn_with_kvcache(
+    q_decode, k_cache, v_cache,
+    k=k_decode, v=v_decode,
+    rotary_cos=rotary_cos,
+    rotary_sin=rotary_sin,
+    cache_seqlens=cache_seqlens,
+    causal=True,
+    # rotary_interleaved=True  -> pairs dims 0&1, 2&3, ... (default)
+    # rotary_interleaved=False -> GPT-NeoX style: pairs 0 & rotary_dim/2, etc.
+)
+```
+
+The key `k` is rotated at positions `cache_seqlens, cache_seqlens + 1, ...`. For causal or local attention, `q` is also rotated at those indices.
+
+## Paged KV cache
+
+For systems that allocate memory in fixed-size pages (e.g., vLLM-style PagedAttention), pass a `block_table` to enable paged attention.
+
+```python
+page_block_size = 256  # must be a multiple of 256
+num_blocks      = 512  # total pages in the pool
+max_blocks_per_seq = 16
+
+# Paged cache: shape is (num_blocks, page_block_size, nheads_k, headdim)
+k_cache_paged = torch.zeros(num_blocks, page_block_size, nheads_k, headdim,
+                             device=device, dtype=dtype)
+v_cache_paged = torch.zeros(num_blocks, page_block_size, nheads_k, headdim,
+                             device=device, dtype=dtype)
+
+# block_table[i, j] is the physical block index for sequence i, logical block j
+block_table = torch.randint(
+    0, num_blocks,
+    (batch_size, max_blocks_per_seq),
+    dtype=torch.int32, device=device,
+)
+
+out = flash_attn_with_kvcache(
+    q_decode, k_cache_paged, v_cache_paged,
+    k=k_decode, v=v_decode,
+    cache_seqlens=cache_seqlens,
+    block_table=block_table,
+    causal=True,
+)
+```
+
+`page_block_size` must be a multiple of 256.
+
+## cache_batch_idx
+
+When the cache batch dimension differs from the query batch dimension (e.g., sharing a cache across beam search candidates), pass `cache_batch_idx` to specify which cache slot each query maps to.
+
+```python
+# Indices mapping each query batch element to a cache slot
+cache_batch_idx = torch.tensor([0, 0, 1, 2], dtype=torch.int32, device=device)
+
+out = flash_attn_with_kvcache(
+    q_decode, k_cache, v_cache,
+    cache_seqlens=cache_seqlens,
+    cache_batch_idx=cache_batch_idx,
+    causal=True,
+)
+```
+
+If `cache_batch_idx` contains duplicate indices and `k`/`v` are provided, the written values are undefined for the duplicated slots.

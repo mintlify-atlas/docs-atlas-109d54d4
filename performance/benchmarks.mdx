@@ -1,0 +1,71 @@
+---
+title: "Benchmarks"
+description: "FlashAttention speedup and memory savings on A100 and H100 GPUs"
+---
+
+FlashAttention delivers significant speedups over standard PyTorch attention and reduces memory usage from quadratic to linear in sequence length. The benchmarks below show combined forward + backward pass performance.
+
+## Benchmark configuration
+
+All benchmarks use the following parameters unless noted otherwise:
+
+- **Head dimension:** 64 or 128
+- **Hidden dimension:** 2048 (32 heads at dim 64, or 16 heads at dim 128)
+- **Sequence lengths:** 512, 1K, 2K, 4K, 8K, 16K
+- **Batch size:** set to `16K / seqlen` (keeps total tokens constant)
+- **Dtype:** FP16 or BF16
+
+<Note>
+Exact speedup factors depend on head dimension, dtype, and hardware. Speedup is generally higher on more memory-bandwidth-limited GPUs, since FlashAttention reduces HBM reads and writes.
+</Note>
+
+## A100
+
+The following results are from an A100 80GB SXM5.
+
+### Speedup
+
+FlashAttention-2 forward + backward speedup vs. PyTorch standard attention:
+
+| Sequence length | Approx. speedup (FP16) |
+|----------------|------------------------|
+| 512            | ~1.5x                  |
+| 1K             | ~2x                    |
+| 2K             | ~3x                    |
+| 4K             | ~4x                    |
+| 8K             | ~5x                    |
+| 16K            | ~6x                    |
+
+### Memory savings
+
+FlashAttention uses memory linear in sequence length. Standard attention uses memory quadratic in sequence length. As a result:
+
+| Sequence length | Memory savings vs. standard attention |
+|----------------|--------------------------------------|
+| 2K             | ~10x                                 |
+| 4K             | ~20x                                 |
+
+Memory footprint is the same regardless of whether you use dropout or masking. These savings allow FlashAttention to scale to much longer sequence lengths than standard attention.
+
+## H100
+
+The following results are from an H100 SXM5, running FP16/BF16.
+
+FlashAttention-2 shows similar relative speedup patterns on H100 as on A100. The absolute throughput is higher due to H100's faster compute and memory bandwidth.
+
+## FlashAttention-3 on H100
+
+FlashAttention-3 is specifically optimized for Hopper GPUs (H100, H800) and delivers additional speedup beyond FlashAttention-2 on that hardware. It targets FP16 forward passes with improvements from Hopper-specific instructions.
+
+Requirements for FlashAttention-3:
+
+- H100 or H800 GPU
+- CUDA >= 12.3 (12.8 recommended for best performance)
+- FP16 or BF16 (FP8 forward pass also supported)
+
+## What affects speedup
+
+- **Head dimension:** Smaller head dimensions tend to be more memory-bandwidth bound, yielding higher relative speedup.
+- **Sequence length:** Speedup increases with sequence length, since the quadratic cost of standard attention grows faster.
+- **Hardware:** More memory-bandwidth-limited GPUs see higher speedup.
+- **Dtype:** FP16 and BF16 are both supported; results are similar between the two.

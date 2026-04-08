@@ -1,0 +1,368 @@
+---
+title: "MHA Module"
+description: "Multi-Head Attention module integrating FlashAttention with QKV projection"
+---
+
+## Overview
+
+`MHA` is a complete multi-head attention layer that bundles QKV projection, the attention kernel (FlashAttention or standard PyTorch), and the output projection into a single `nn.Module`. It is **not** a bare attention kernel — it accepts raw hidden states and returns projected output, making it a drop-in building block for transformer encoder/decoder stacks.
+
+Supports self-attention and cross-attention, MHA / MQA / GQA head configurations, rotary positional embeddings, ALiBi, sliding-window (local) attention, and autoregressive KV-cache inference.
+
+```python
+from flash_attn.modules.mha import MHA
+```
+
+---
+
+## Constructor
+
+```python
+MHA(
+    embed_dim,
+    num_heads,
+    num_heads_kv=None,
+    cross_attn=False,
+    qkv_proj_bias=True,
+    out_proj_bias=True,
+    dropout=0.0,
+    softmax_scale=None,
+    causal=False,
+    layer_idx=None,
+    dwconv=False,
+    rotary_emb_dim=0,
+    rotary_emb_base=10000.0,
+    rotary_emb_scale_base=None,
+    rotary_emb_interleaved=False,
+    use_alibi=False,
+    window_size=(-1, -1),
+    fused_bias_fc=False,
+    use_flash_attn=False,
+    return_residual=False,
+    checkpointing=False,
+    device=None,
+    dtype=None,
+)
+```
+
+### Parameters
+
+<ParamField path="embed_dim" type="int" required>
+  Total embedding dimension. Must be divisible by `num_heads`. Determines the
+  size of the QKV and output projections.
+</ParamField>
+
+<ParamField path="num_heads" type="int" required>
+  Number of query attention heads.
+</ParamField>
+
+<ParamField path="num_heads_kv" type="int | None" default="None">
+  Number of key/value heads. Set to a value smaller than `num_heads` to enable
+  **MQA** (`num_heads_kv=1`) or **GQA** (any divisor of `num_heads`). When
+  `None`, defaults to `num_heads` (standard MHA). `num_heads` must be divisible
+  by `num_heads_kv`.
+</ParamField>
+
+<ParamField path="cross_attn" type="bool" default="False">
+  When `True`, the module operates in **cross-attention** mode. Separate `Wq`
+  and `Wkv` projections are created instead of a single fused `Wqkv`. The
+  forward method then expects `x_kv` as the key/value source. Incompatible with
+  rotary embeddings.
+</ParamField>
+
+<ParamField path="qkv_proj_bias" type="bool" default="True">
+  Whether to include a bias term in the QKV projection linear layer(s).
+</ParamField>
+
+<ParamField path="out_proj_bias" type="bool" default="True">
+  Whether to include a bias term in the output projection linear layer.
+</ParamField>
+
+<ParamField path="dropout" type="float" default="0.0">
+  Dropout probability applied to the attention weights.
+</ParamField>
+
+<ParamField path="softmax_scale" type="float | None" default="None">
+  Scale factor applied before the softmax. Defaults to `1 / sqrt(head_dim)`
+  when `None`.
+</ParamField>
+
+<ParamField path="causal" type="bool" default="False">
+  When `True`, applies a causal (autoregressive) mask so each position can only
+  attend to itself and earlier positions.
+</ParamField>
+
+<ParamField path="layer_idx" type="int | None" default="None">
+  Index of this layer in the model stack. **Required** when using
+  `inference_params` (KV-cache generation), because the cache is keyed by layer
+  index.
+</ParamField>
+
+<ParamField path="dwconv" type="bool" default="False">
+  When `True`, applies a depthwise 1-D convolution (kernel size 3) to the QKV
+  projections before computing attention. Not compatible with generation
+  (`inference_params`).
+</ParamField>
+
+<ParamField path="rotary_emb_dim" type="int" default="0">
+  Dimensionality of rotary positional embeddings applied to Q and K. Set to
+  `head_dim` (or a fraction of it) to enable RoPE. `0` disables rotary
+  embeddings. Incompatible with `cross_attn=True`.
+</ParamField>
+
+<ParamField path="rotary_emb_base" type="float" default="10000.0">
+  Base value for computing rotary embedding frequencies. Increase (e.g.
+  `500000.0` for Llama-3) to support longer context lengths.
+</ParamField>
+
+<ParamField path="rotary_emb_scale_base" type="float | None" default="None">
+  When set, enables **XPos** positional scaling (Sun et al., 2022). A
+  recommended value is `512`. When `None`, standard RoPE is used without
+  position-dependent scaling.
+</ParamField>
+
+<ParamField path="rotary_emb_interleaved" type="bool" default="False">
+  Rotation style for RoPE. When `False` (default), rotates the first half and
+  second half of each dimension pair — GPT-NeoX style. When `True`, rotates
+  pairs of even/odd dimensions — GPT-J style.
+</ParamField>
+
+<ParamField path="use_alibi" type="bool" default="False">
+  When `True`, uses **ALiBi** (Attention with Linear Biases) instead of
+  explicit positional embeddings. Requires `use_flash_attn=True`.
+</ParamField>
+
+<ParamField path="window_size" type="tuple[int, int]" default="(-1, -1)">
+  Sliding-window (local) attention window. A tuple `(left, right)` where `-1`
+  means unbounded. For example, `(512, 0)` attends to the 512 most recent
+  tokens (causal local attention). Requires `use_flash_attn=True`.
+</ParamField>
+
+<ParamField path="fused_bias_fc" type="bool" default="False">
+  When `True`, uses a fused kernel for the linear layers with bias. Requires the
+  optional `flash_attn.ops.fused_dense` package to be installed.
+</ParamField>
+
+<ParamField path="use_flash_attn" type="bool" default="False">
+  When `True`, uses FlashAttention kernels for the inner attention computation.
+  Required for `use_alibi`, `window_size`, and the fast rotary+KV-cache path
+  during generation.
+</ParamField>
+
+<ParamField path="return_residual" type="bool" default="False">
+  When `True`, the forward method returns a tuple `(output, input_x)`. The
+  input passthrough enables post-norm architectures to fuse the residual
+  connection with the backward pass through `nn.Linear`, improving efficiency.
+</ParamField>
+
+<ParamField path="checkpointing" type="bool" default="False">
+  When `True`, wraps the inner attention call with
+  `torch.utils.checkpoint.checkpoint` to trade compute for memory during
+  training.
+</ParamField>
+
+<ParamField path="device" type="torch.device | str | None" default="None">
+  Device on which to create the layer parameters. Passed through to all internal
+  `nn.Linear` modules.
+</ParamField>
+
+<ParamField path="dtype" type="torch.dtype | None" default="None">
+  Data type for the layer parameters. Passed through to all internal `nn.Linear`
+  modules.
+</ParamField>
+
+---
+
+## Forward Method
+
+```python
+MHA.forward(
+    x,
+    x_kv=None,
+    key_padding_mask=None,
+    cu_seqlens=None,
+    max_seqlen=None,
+    mixer_subset=None,
+    inference_params=None,
+    **kwargs,
+)
+```
+
+### Parameters
+
+<ParamField path="x" type="Tensor" required>
+  Input hidden states.
+
+  - Shape `(batch, seqlen, embed_dim)` when `cu_seqlens` is `None`.
+  - Shape `(total_tokens, embed_dim)` (packed/unpadded) when `cu_seqlens` is
+    provided. `total_tokens` is the sum of all sequence lengths in the batch.
+</ParamField>
+
+<ParamField path="x_kv" type="Tensor | None" default="None">
+  Key/value source for **cross-attention** (`cross_attn=True`). Shape
+  `(batch, seqlen_kv, embed_dim)`. When `None`, the module falls back to `x`
+  as the KV source (self-attention behaviour).
+</ParamField>
+
+<ParamField path="key_padding_mask" type="BoolTensor | None" default="None">
+  Boolean padding mask of shape `(batch, seqlen)`. `True` means keep the
+  position, `False` means mask it out. Only applicable when
+  `use_flash_attn=False`. Mutually exclusive with `cu_seqlens`.
+</ParamField>
+
+<ParamField path="cu_seqlens" type="IntTensor | None" default="None">
+  Cumulative sequence lengths of shape `(batch + 1,)`, dtype `torch.int32`.
+  Used with packed (unpadded) inputs. Requires `use_flash_attn=True`.
+  Mutually exclusive with `key_padding_mask`.
+</ParamField>
+
+<ParamField path="max_seqlen" type="int | None" default="None">
+  Maximum sequence length in the batch. Required when `cu_seqlens` is provided.
+</ParamField>
+
+<ParamField path="mixer_subset" type="slice | Tensor | None" default="None">
+  Cross-attention only. An index or slice selecting a subset of `x` positions
+  before applying the query projection. Useful in ViT-style models where only
+  the CLS token participates in attention in the final layer.
+</ParamField>
+
+<ParamField path="inference_params" type="object | None" default="None">
+  Inference-time parameter object for **KV-cache generation** (compatible with
+  the Megatron-LM / Apex interface). Must expose `seqlen_offset`,
+  `max_seqlen`, `max_batch_size`, `key_value_memory_dict`, and optionally
+  `lengths_per_sample`. Requires `layer_idx` to be set in the constructor.
+  Mutually exclusive with `key_padding_mask`, `cu_seqlens`, and `dwconv`.
+</ParamField>
+
+### Returns
+
+| `return_residual` | Return value |
+|---|---|
+| `False` (default) | `Tensor` of shape `(batch, seqlen, embed_dim)` |
+| `True` | `tuple[Tensor, Tensor]` — `(output, x)` |
+
+---
+
+## Architecture Notes
+
+`MHA` is a **full attention layer**, not a bare kernel. Internally it composes:
+
+1. **QKV projection** — a single fused `nn.Linear` (`Wqkv`) for self-attention, or separate `Wq` / `Wkv` for cross-attention.
+2. **Optional depthwise conv** — applied to the QKV projections before attention when `dwconv=True`.
+3. **Optional rotary embeddings** — applied in-place to Q (and K) before attention.
+4. **Inner attention** — either `FlashSelfAttention` / `FlashCrossAttention` (when `use_flash_attn=True`) or pure-PyTorch `SelfAttention` / `CrossAttention` fallbacks.
+5. **Output projection** — `nn.Linear` mapping concatenated heads back to `embed_dim`.
+
+---
+
+## Usage Examples
+
+### Basic self-attention layer
+
+```python
+import torch
+from flash_attn.modules.mha import MHA
+
+# Standard MHA with FlashAttention, causal masking
+attn = MHA(
+    embed_dim=1024,
+    num_heads=16,
+    causal=True,
+    use_flash_attn=True,
+).cuda().to(torch.bfloat16)
+
+x = torch.randn(2, 512, 1024, device="cuda", dtype=torch.bfloat16)
+out = attn(x)          # (2, 512, 1024)
+```
+
+### Grouped-query attention (GQA)
+
+```python
+# 32 query heads, 8 KV heads — Llama-style GQA
+attn = MHA(
+    embed_dim=4096,
+    num_heads=32,
+    num_heads_kv=8,
+    causal=True,
+    use_flash_attn=True,
+    rotary_emb_dim=128,         # head_dim = 4096 // 32 = 128
+    rotary_emb_base=500000.0,   # Llama-3 base
+).cuda().to(torch.bfloat16)
+
+x = torch.randn(1, 2048, 4096, device="cuda", dtype=torch.bfloat16)
+out = attn(x)   # (1, 2048, 4096)
+```
+
+### Cross-attention
+
+```python
+enc_attn = MHA(
+    embed_dim=512,
+    num_heads=8,
+    cross_attn=True,
+    use_flash_attn=True,
+).cuda().to(torch.float16)
+
+tgt = torch.randn(2, 64,  512, device="cuda", dtype=torch.float16)  # decoder tokens
+src = torch.randn(2, 128, 512, device="cuda", dtype=torch.float16)  # encoder output
+
+out = enc_attn(tgt, x_kv=src)  # (2, 64, 512)
+```
+
+### Packed (variable-length) inputs with FlashAttention
+
+```python
+# Two sequences of length 3 and 5 packed into a single tensor of 8 tokens
+x_packed = torch.randn(8, 1024, device="cuda", dtype=torch.bfloat16)
+cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32, device="cuda")
+
+attn = MHA(1024, 16, causal=True, use_flash_attn=True).cuda().to(torch.bfloat16)
+out = attn(x_packed, cu_seqlens=cu_seqlens, max_seqlen=5)  # (8, 1024)
+```
+
+### Return residual for post-norm architectures
+
+```python
+attn = MHA(
+    embed_dim=768,
+    num_heads=12,
+    use_flash_attn=True,
+    return_residual=True,
+).cuda().to(torch.bfloat16)
+
+x = torch.randn(2, 256, 768, device="cuda", dtype=torch.bfloat16)
+out, residual = attn(x)   # out: (2, 256, 768), residual: same as x
+```
+
+### KV-cache autoregressive generation
+
+```python
+from types import SimpleNamespace
+
+attn = MHA(
+    embed_dim=1024,
+    num_heads=16,
+    layer_idx=0,         # required for generation
+    causal=True,
+    use_flash_attn=True,
+).cuda().to(torch.bfloat16)
+
+# Pre-fill
+x_prefill = torch.randn(1, 128, 1024, device="cuda", dtype=torch.bfloat16)
+kv_cache = attn.allocate_inference_cache(batch_size=1, max_seqlen=256)
+
+inference_params = SimpleNamespace(
+    max_batch_size=1,
+    max_seqlen=256,
+    seqlen_offset=0,
+    batch_size_offset=0,
+    key_value_memory_dict={0: kv_cache},
+    lengths_per_sample=None,
+)
+out = attn(x_prefill, inference_params=inference_params)
+
+# Decode (one token at a time)
+inference_params.seqlen_offset = 128
+x_token = torch.randn(1, 1, 1024, device="cuda", dtype=torch.bfloat16)
+out = attn(x_token, inference_params=inference_params)  # (1, 1, 1024)
+```

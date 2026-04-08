@@ -1,0 +1,137 @@
+---
+title: "Installation"
+description: "Install FlashAttention for CUDA or ROCm GPUs"
+---
+
+## Requirements
+
+Before installing, ensure your environment meets the following prerequisites:
+
+| Requirement | Minimum version |
+|---|---|
+| CUDA toolkit | 12.0 |
+| PyTorch | 2.2 |
+| OS | Linux (Windows experimental from v2.3.2) |
+| Python packages | `packaging`, `psutil`, `ninja` |
+
+Install the required Python packages:
+
+```bash
+pip install packaging psutil ninja
+```
+
+<Note>
+  Verify that `ninja` is working correctly by running `ninja --version && echo $?` — the exit code must be `0`. Without a working `ninja`, compilation falls back to a single CPU core and can take up to 2 hours. With `ninja` on a 64-core machine, compilation takes 3–5 minutes.
+</Note>
+
+## Install FlashAttention-2
+
+<Steps>
+  <Step title="Install via pip">
+    The recommended approach is to install a prebuilt wheel directly from PyPI:
+
+    ```bash
+    pip install flash-attn --no-build-isolation
+    ```
+  </Step>
+  <Step title="Limit parallel jobs on low-RAM machines">
+    If your machine has less than 96 GB of RAM and many CPU cores, `ninja` may spawn too many parallel compilation jobs and exhaust memory. Cap the number of jobs with `MAX_JOBS`:
+
+    ```bash
+    MAX_JOBS=4 pip install flash-attn --no-build-isolation
+    ```
+  </Step>
+  <Step title="Build from source (alternative)">
+    You can also compile directly from the repository:
+
+    ```bash
+    python setup.py install
+    ```
+  </Step>
+</Steps>
+
+## Install FlashAttention-4 (CuTeDSL)
+
+FA4 is distributed as a separate package (`flash-attn-4`). It targets Hopper (H100) and Blackwell (B200) GPUs and compiles kernels at runtime via CuTeDSL.
+
+<CodeGroup>
+
+```bash Standard install
+pip install flash-attn-4
+```
+
+```bash CUDA 13 (recommended on CUDA 13)
+pip install "flash-attn-4[cu13]"
+```
+
+</CodeGroup>
+
+## Install FlashAttention-3 (Hopper beta)
+
+FA3 is a beta release for H100/H800 GPUs and is not yet integrated into the main package. Install it from the `hopper/` subdirectory of the source tree.
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/Dao-AILab/flash-attention.git
+    cd flash-attention
+    ```
+  </Step>
+  <Step title="Install from the hopper directory">
+    ```bash
+    cd hopper
+    python setup.py install
+    ```
+
+    <Warning>
+      FA3 requires CUDA ≥ 12.3. CUDA 12.8 is recommended for best performance.
+    </Warning>
+  </Step>
+  <Step title="Run the test suite">
+    ```bash
+    export PYTHONPATH=$PWD
+    pytest -q -s test_flash_attn.py
+    ```
+  </Step>
+</Steps>
+
+## AMD ROCm install
+
+FlashAttention-2 supports ROCm 6.0+ with two backends: Composable Kernel (CK, default) and Triton.
+
+<Tabs>
+  <Tab title="Triton backend">
+    First install PyTorch for ROCm from [pytorch.org/get-started/locally](https://pytorch.org/get-started/locally/), then:
+
+    ```bash
+    FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
+    ```
+
+    The Triton backend supports MI200 (CDNA), MI300, and RDNA GPUs with fp16, bf16, and fp32. It also supports causal masking, variable sequence lengths, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the FA3 interface).
+  </Tab>
+  <Tab title="CK backend (default)">
+    Install with the standard pip command. The CK backend is selected automatically when a ROCm-enabled PyTorch is detected:
+
+    ```bash
+    pip install flash-attn --no-build-isolation
+    ```
+
+    Supports MI200x, MI250x, MI300x, MI355x, and RDNA 3/4 GPUs with fp16 and bf16, head dimensions up to 256.
+  </Tab>
+</Tabs>
+
+## Verify the installation
+
+After installing, confirm the package imports correctly and reports its version:
+
+```python
+import flash_attn
+print(flash_attn.__version__)  # e.g. 2.8.4
+
+import torch
+print(torch.cuda.is_available())  # True on a CUDA-enabled machine
+```
+
+<Check>
+  If both lines print without error and `torch.cuda.is_available()` returns `True`, your installation is ready.
+</Check>

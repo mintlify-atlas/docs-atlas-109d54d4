@@ -1,0 +1,101 @@
+---
+title: "Introduction"
+description: "FlashAttention — fast, memory-efficient exact attention for PyTorch transformers"
+---
+
+FlashAttention is an IO-aware exact attention algorithm that computes scaled dot-product attention (softmax(QK^T \* softmax_scale) @ V) significantly faster and with far less memory than standard implementations. Rather than materializing the full attention matrix in high-bandwidth memory (HBM), FlashAttention tiles the computation across SRAM, reducing memory reads and writes by an order of magnitude. The result is exact attention — not an approximation — with sub-quadratic memory usage in sequence length.
+
+FlashAttention-2 extended the original work with improved parallelism and work partitioning, achieving up to 2x speedup over FA1 and reaching 50-73% of A100 theoretical peak FLOPS for forward passes. The library is now widely adopted across research and production transformer workloads.
+
+## Key benefits
+
+<CardGroup cols={2}>
+  <Card title="Speed" icon="bolt">
+    2-4x faster than standard PyTorch attention. FlashAttention-2 reaches 50–73% of A100 peak FLOPS on forward passes, reducing wall-clock time for both training and inference.
+  </Card>
+  <Card title="Memory efficiency" icon="memory">
+    Sub-quadratic memory usage in sequence length. Avoids materializing the full N×N attention matrix in HBM, enabling much longer sequences on the same hardware.
+  </Card>
+  <Card title="GPU support" icon="microchip">
+    CUDA: Ampere, Ada, and Hopper GPUs (A100, RTX 3090/4090, H100). AMD ROCm: MI200x, MI250x, MI300x, MI355x, and RDNA 3/4 GPUs via CK or Triton backends.
+  </Card>
+  <Card title="Compatibility" icon="puzzle-piece">
+    Supports fp16 and bf16 dtypes, head dimensions up to 256, MQA/GQA, dropout, causal masking, sliding window attention, ALiBi slopes, and paged KV cache. Compatible with `torch.compile` (PyTorch ≥ 2.4).
+  </Card>
+</CardGroup>
+
+## Versions overview
+
+<Tabs>
+  <Tab title="FlashAttention-2 (stable)">
+    The primary stable release. Optimized for Ampere, Ada, and Hopper GPUs on CUDA, and MI-series / RDNA GPUs on ROCm.
+
+    | Property | Value |
+    |---|---|
+    | Status | Stable |
+    | GPU targets | A100, RTX 3090/4090, H100 (CUDA); MI200x–MI355x, RDNA 3/4 (ROCm) |
+    | Datatypes | fp16, bf16 |
+    | Head dim | Up to 256 |
+    | Install | `pip install flash-attn --no-build-isolation` |
+    | Package | `flash_attn` |
+    | Import | `from flash_attn import flash_attn_func` |
+    | Version | 2.8.4 |
+  </Tab>
+  <Tab title="FlashAttention-3 (Hopper beta)">
+    A beta release targeting Hopper GPUs (H100/H800). Adds FP8 forward support and further optimizations for SM90 hardware. Not yet integrated into the main package.
+
+    | Property | Value |
+    |---|---|
+    | Status | Beta |
+    | GPU targets | H100, H800 (Hopper / SM90) |
+    | Datatypes | fp16, bf16 (fwd + bwd), fp8 (fwd only) |
+    | CUDA requirement | ≥ 12.3 (12.8 recommended) |
+    | Install | `cd hopper && python setup.py install` |
+    | Import | `import flash_attn_interface` |
+  </Tab>
+  <Tab title="FlashAttention-4 (CuTeDSL)">
+    Written in CuTeDSL (NVIDIA CUTLASS Python DSL), targeting Hopper and Blackwell GPUs. Kernels are JIT-compiled at runtime to PTX/CUBIN. Distributed as a separate package.
+
+    | Property | Value |
+    |---|---|
+    | Status | Active development |
+    | GPU targets | H100 (SM90), B200 (SM100/SM110, Blackwell) |
+    | Install | `pip install flash-attn-4` |
+    | CUDA 13 variant | `pip install "flash-attn-4[cu13]"` |
+    | Import | `from flash_attn.cute import flash_attn_func` |
+  </Tab>
+</Tabs>
+
+## Citations
+
+If you use FlashAttention in your research, please cite the relevant paper.
+
+**FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness**
+Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré
+NeurIPS 2022 — [https://arxiv.org/abs/2205.14135](https://arxiv.org/abs/2205.14135)
+
+```bibtex
+@inproceedings{dao2022flashattention,
+  title={Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
+  author={Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+  booktitle={Advances in Neural Information Processing Systems},
+  year={2022}
+}
+```
+
+**FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning**
+Tri Dao
+ICLR 2024 — [https://tridao.me/publications/flash2/flash2.pdf](https://tridao.me/publications/flash2/flash2.pdf)
+
+```bibtex
+@inproceedings{dao2023flashattention2,
+  title={Flash{A}ttention-2: Faster Attention with Better Parallelism and Work Partitioning},
+  author={Dao, Tri},
+  booktitle={International Conference on Learning Representations},
+  year={2024}
+}
+```
+
+## License
+
+FlashAttention is released under the **BSD-3-Clause** license. You are free to use and modify it — please cite and credit FlashAttention if you do.

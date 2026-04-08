@@ -1,97 +1,87 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "FlashAttention"
+description: "Fast, memory-efficient exact attention for PyTorch — up to 10x faster and 20x less memory than standard attention"
 ---
 
-## Setting up
+FlashAttention is an IO-aware exact attention algorithm that dramatically reduces memory usage and accelerates transformer training and inference. Instead of materializing the full NxN attention matrix in slow HBM, FlashAttention tiles computation to keep data in fast SRAM — achieving linear memory complexity and significant throughput improvements.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install FlashAttention via pip or build from source for CUDA or ROCm
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first flash attention forward pass in minutes
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="API Reference" icon="code" href="/api/flash-attn-func">
+    Full API documentation for all attention functions
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Performance" icon="bolt" href="/performance/benchmarks">
+    Benchmark results and speedups on A100 and H100 GPUs
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## What makes FlashAttention fast
 
-Everything you need to create world-class documentation.
+Standard attention requires O(N²) memory because it materializes the full attention matrix in HBM. FlashAttention uses tiling to avoid this — kernels load blocks of Q, K, V tiles into SRAM and fuse the softmax+matmul operations in a single pass.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={3}>
+  <Card title="IO-aware design" icon="memory" href="/concepts/io-awareness">
+    Minimizes slow HBM reads/writes through tiling and kernel fusion
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Linear memory" icon="chart-line" href="/concepts/memory-efficiency">
+    O(N) memory vs O(N²) for standard attention — 20x savings at seqlen=4096
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="Broad GPU support" icon="microchip" href="/concepts/hardware-support">
+    NVIDIA Ampere, Ada, Hopper, Blackwell — plus AMD ROCm
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+</CardGroup>
 
-## Need inspiration?
+## Versions
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={2}>
+  <Card title="FlashAttention-2" icon="2" href="/installation">
+    Stable release. Supports CUDA and ROCm. Install with `pip install flash-attn`.
+  </Card>
+  <Card title="FlashAttention-4 (CuTeDSL)" icon="4" href="/installation">
+    Latest generation for Hopper and Blackwell. Install with `pip install flash-attn-4`.
+  </Card>
+</CardGroup>
+
+## Get started
+
+<Steps>
+  <Step title="Install the package">
+    ```bash
+    pip install flash-attn --no-build-isolation
+    ```
+  </Step>
+  <Step title="Import and call flash attention">
+    ```python
+    from flash_attn import flash_attn_func
+    import torch
+
+    # q, k, v: (batch, seqlen, nheads, headdim)
+    q = torch.randn(2, 1024, 16, 64, dtype=torch.float16, device="cuda")
+    k = torch.randn(2, 1024, 16, 64, dtype=torch.float16, device="cuda")
+    v = torch.randn(2, 1024, 16, 64, dtype=torch.float16, device="cuda")
+
+    out = flash_attn_func(q, k, v, causal=True)
+    # out: (batch, seqlen, nheads, headdim)
+    ```
+  </Step>
+  <Step title="Use in your model">
+    Drop FlashAttention into any transformer layer — it is a drop-in replacement for `torch.nn.functional.scaled_dot_product_attention`.
+    See the [Guides](/guides/basic-attention) for integration patterns.
+  </Step>
+</Steps>
+
+## Key capabilities
+
+- **Causal masking** — Auto-regressive language model attention with `causal=True`
+- **Sliding window attention** — Local attention with `window_size=(left, right)`
+- **GQA / MQA** — Grouped-query and multi-query attention for efficient inference
+- **KV cache** — Incremental decoding with `flash_attn_with_kvcache`
+- **Variable-length sequences** — Packed batches with `flash_attn_varlen_func`
+- **ALiBi** — Attention with linear biases for length extrapolation
+- **Softcapping** — Used in Gemma-2 and Grok models
+- **torch.compile()** — Compatible with PyTorch 2.4+ compilation

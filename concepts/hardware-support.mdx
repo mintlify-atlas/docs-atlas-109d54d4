@@ -1,0 +1,76 @@
+---
+title: "Hardware Support"
+description: "GPU architectures and compute capabilities supported by FlashAttention"
+---
+
+FlashAttention supports a range of NVIDIA and AMD GPUs. Different FlashAttention versions target different architectures, and feature availability varies by GPU generation.
+
+## NVIDIA CUDA
+
+**Requirements:** CUDA 12.0+ and PyTorch 2.2+.
+
+### Supported architectures
+
+| Architecture | Example GPUs | FA2 | FA3 | FA4 |
+|-------------|-------------|-----|-----|-----|
+| Ampere | A100, RTX 3090 | Yes | — | Yes |
+| Ada Lovelace | RTX 4090 | Yes | — | Yes |
+| Hopper | H100, H800 | Yes | Beta | Yes |
+| Blackwell | B200 | — | — | Yes |
+| Turing | T4, RTX 2080 | See note | — | — |
+
+<Note>
+Turing GPUs are not supported in this repository. See the separate [flash-attention-turing](https://github.com/ssiu/flash-attention-turing) repo, which supports a core subset of FlashAttention features on Turing.
+</Note>
+
+### Version-specific CUDA requirements
+
+| Version | Minimum CUDA | Notes |
+|---------|-------------|-------|
+| FA2 | 12.0 | Main package: `pip install flash-attn` |
+| FA3 | 12.3 | Beta; CUDA 12.8 recommended for best performance |
+| FA4 | 12.0+ | Separate package: `pip install flash-attn-4` |
+
+### Supported dtypes
+
+- **fp16**: all supported architectures
+- **bf16**: Ampere, Ada, and Hopper (bf16 requires at least Ampere)
+- **FP8 forward**: Hopper and Blackwell only
+
+### Head dimensions
+
+| Version | Supported head dimensions |
+|---------|--------------------------|
+| FA2 | All head dims up to 256 |
+| FA4 | 64, 96, 128, and (192, 128 for specific configs) |
+
+## AMD ROCm
+
+**Requirements:** ROCm 6.0+.
+
+FlashAttention on ROCm implements FlashAttention-2 and provides two backends.
+
+### Supported GPUs
+
+| GPU family | Forward | Backward |
+|-----------|---------|----------|
+| MI200x, MI250x | Yes | Yes |
+| MI300x, MI355x | Yes | Yes |
+| RDNA 3 | Yes | Not supported |
+| RDNA 4 | Yes | `deterministic=False` only |
+
+### Backends
+
+**Composable Kernel (default):** Uses [composable_kernel](https://github.com/ROCm/composable_kernel) (CK). Supports fp16 and bf16. Head dims up to 256 for both forward and backward.
+
+**Triton backend:** Supports CDNA (MI200, MI300) and RDNA GPUs with fp16, bf16, and fp32. Includes causal masking, variable sequence lengths, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via FA3 interface). Enable with:
+
+```sh
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
+```
+
+## Windows
+
+<Note>
+Windows support is experimental as of v2.3.2. There have been positive reports of successful compilation, but Windows support is not fully tested. Linux is the recommended platform.
+</Note>

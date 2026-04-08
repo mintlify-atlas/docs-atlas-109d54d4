@@ -1,0 +1,179 @@
+---
+title: "Advanced Features"
+description: "ALiBi, softcapping, deterministic backward, and torch.compile support"
+---
+
+## ALiBi (Attention with Linear Biases)
+
+ALiBi (Press et al., 2021) replaces positional encodings with a distance-based bias added directly to the attention scores. For query position `i` and key position `j`, the bias is:
+
+```
+score(i, j) += -alibi_slope * |i + seqlen_k - seqlen_q - j|
+```
+
+Pass `alibi_slopes` to any FlashAttention function to enable it.
+
+**Shape:** `(nheads,)` for a shared slope per head, or `(batch_size, nheads)` for per-sequence slopes. The tensor must be `float32`.
+
+### Creating ALiBi slopes
+
+The standard approach (from the original paper) assigns slopes as a geometric sequence based on head count:
+
+```python
+import math
+import torch
+from flash_attn import flash_attn_func
+
+def get_alibi_slopes(nheads: int) -> torch.Tensor:
+    """Compute ALiBi slopes for a given number of heads."""
+    # Slopes are powers of 2^(-8/nheads), one per head
+    closest_power_of_2 = 2 ** math.floor(math.log2(nheads))
+    base = 2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3)))
+    slopes = torch.pow(base, torch.arange(1, closest_power_of_2 + 1))
+
+    if closest_power_of_2 != nheads:
+        extra_base  = 2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3)))
+        num_remaining = min(closest_power_of_2, nheads - closest_power_of_2)
+        extra_slopes  = torch.pow(extra_base, torch.arange(1, 1 + 2 * num_remaining, 2))
+        slopes = torch.cat([slopes, extra_slopes])
+
+    return slopes.float()
+
+nheads = 16
+batch_size, seqlen, headdim = 2, 1024, 64
+
+q = torch.randn(batch_size, seqlen, nheads, headdim, device="cuda", dtype=torch.float16)
+k = torch.randn(batch_size, seqlen, nheads, headdim, device="cuda", dtype=torch.float16)
+v = torch.randn(batch_size, seqlen, nheads, headdim, device="cuda", dtype=torch.float16)
+
+# Per-head slopes (same for all sequences in the batch)
+alibi_slopes = get_alibi_slopes(nheads).cuda()  # (nheads,)
+
+out = flash_attn_func(q, k, v, alibi_slopes=alibi_slopes)
+```
+
+For per-sequence slopes, reshape to `(batch_size, nheads)`:
+
+```python
+# Different slopes for each sequence in the batch
+alibi_slopes_per_seq = alibi_slopes.unsqueeze(0).expand(batch_size, -1).contiguous()
+# shape: (batch_size, nheads)
+
+out = flash_attn_func(q, k, v, alibi_slopes=alibi_slopes_per_seq)
+```
+
+---
+
+## Softcapping
+
+Softcapping bounds attention logits before the softmax to prevent extremely large values. The transformation is:
+
+```
+logit = softcap * tanh(logit / softcap)
+```
+
+This is equivalent to dividing by `softcap`, applying `tanh`, then multiplying back. It is used in Gemma-2 and Grok models.
+
+Set `softcap` to a positive float to enable it (available in FlashAttention >= 2.6). A value of `0.0` disables softcapping.
+
+```python
+from flash_attn import flash_attn_func
+
+# Gemma-2 uses softcap=50.0
+out = flash_attn_func(q, k, v, causal=True, softcap=50.0)
+```
+
+`softcap` is supported by all the main functions: `flash_attn_func`, `flash_attn_qkvpacked_func`, `flash_attn_kvpacked_func`, `flash_attn_varlen_func`, and `flash_attn_with_kvcache`.
+
+---
+
+## Deterministic backward pass
+
+By default, FlashAttention's backward pass uses non-deterministic atomics for speed. Pass `deterministic=True` to use an alternative backward that produces identical gradients across runs at the cost of slightly more memory and runtime.
+
+The forward pass is always deterministic regardless of this flag.
+
+```python
+from flash_attn import flash_attn_func
+
+# Non-deterministic (default, faster)
+out = flash_attn_func(q, k, v, deterministic=False)
+
+# Deterministic (reproducible gradients, slightly slower)
+out = flash_attn_func(q, k, v, deterministic=True)
+```
+
+<Note>
+  `deterministic=True` affects only the backward pass. Use it when you need
+  reproducible training runs, for debugging gradient issues, or when running
+  numerical tests that compare gradients across runs.
+</Note>
+
+---
+
+## torch.compile() support
+
+FlashAttention supports `torch.compile()` with PyTorch >= 2.4. The library uses the `torch.library.custom_op` and `torch.library.register_fake` APIs (introduced in 2.4) to register its CUDA kernels as first-class custom ops that the compiler can reason about.
+
+```python
+import torch
+import torch.nn as nn
+from flash_attn import flash_attn_func
+
+class FlashAttentionLayer(nn.Module):
+    def __init__(self, nheads, headdim):
+        super().__init__()
+        self.nheads   = nheads
+        self.headdim  = headdim
+        self.q_proj   = nn.Linear(nheads * headdim, nheads * headdim)
+        self.k_proj   = nn.Linear(nheads * headdim, nheads * headdim)
+        self.v_proj   = nn.Linear(nheads * headdim, nheads * headdim)
+        self.out_proj = nn.Linear(nheads * headdim, nheads * headdim)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q = self.q_proj(x).view(B, T, self.nheads, self.headdim)
+        k = self.k_proj(x).view(B, T, self.nheads, self.headdim)
+        v = self.v_proj(x).view(B, T, self.nheads, self.headdim)
+        out = flash_attn_func(q, k, v, causal=True)
+        return self.out_proj(out.view(B, T, C))
+
+nheads, headdim = 16, 64
+model = FlashAttentionLayer(nheads, headdim).cuda().to(torch.float16)
+
+# Compile the model (requires PyTorch >= 2.4)
+compiled_model = torch.compile(model)
+
+x = torch.randn(2, 1024, nheads * headdim, device="cuda", dtype=torch.float16)
+out = compiled_model(x)
+```
+
+For PyTorch < 2.4, `flash_attn_func` still works but is not recognized as a custom op by the compiler, so compilation will graph-break at the attention call.
+
+---
+
+## return_attn_probs
+
+Pass `return_attn_probs=True` to get the softmax output (attention weights) alongside the attention result. This is useful for debugging and inspecting attention patterns.
+
+```python
+from flash_attn import flash_attn_func
+
+out, softmax_lse, S_dmask = flash_attn_func(
+    q, k, v,
+    dropout_p=0.1,        # dropout must be > 0 for S_dmask to be populated
+    return_attn_probs=True,
+)
+
+# out:         (batch_size, seqlen, nheads, headdim)
+# softmax_lse: (batch_size, nheads, seqlen) — log-sum-exp of each row
+# S_dmask:     (batch_size, nheads, seqlen, seqlen) — softmax output;
+#              negative values mark dropped positions
+```
+
+<Warning>
+  `return_attn_probs` is intended for testing only. The returned probabilities
+  may not have the correct scaling, and materializing the full
+  `(batch, nheads, seqlen, seqlen)` attention matrix negates the memory savings
+  that FlashAttention provides. Do not use this in production code.
+</Warning>

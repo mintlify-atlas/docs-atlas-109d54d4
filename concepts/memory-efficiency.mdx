@@ -1,0 +1,57 @@
+---
+title: "Memory Efficiency"
+description: "FlashAttention's linear memory complexity versus the quadratic cost of standard attention"
+---
+
+One of FlashAttention's most significant practical advantages is its memory footprint. Standard attention uses memory quadratic in sequence length. FlashAttention uses memory linear in sequence length. For long sequences, this difference is the deciding factor in whether training is possible at all.
+
+## Standard attention: O(N²) memory
+
+Standard attention stores the full N×N attention matrix in HBM. At sequence length N:
+
+- The attention score matrix `S = Q @ K^T` requires N² floats
+- The softmax output matrix `P = softmax(S)` requires another N² floats
+- Total attention memory scales as **O(N²)**
+
+Double the sequence length and you need four times the memory.
+
+## FlashAttention: O(N) memory
+
+FlashAttention never writes the full attention matrix to HBM. Instead, it only stores:
+
+- The output `O` — shape `(N, d)`, linear in N
+- The log-sum-exp `L` for each row — shape `(N,)`, linear in N
+
+Everything else is computed on-the-fly in SRAM and discarded. Total memory scales as **O(N)**.
+
+## Concrete savings
+
+The memory savings compound with sequence length:
+
+| Sequence length | Memory savings vs. standard attention |
+|----------------|--------------------------------------|
+| 2048 | ~10× |
+| 4096 | ~20× |
+
+These figures come from the FlashAttention benchmarks on A100. Memory footprint is the same regardless of whether you use dropout or masking.
+
+<Tip>
+If you're running out of GPU memory with long sequences, FlashAttention is usually the first thing to try. The memory savings at seqlen 4096 are so large that it can make previously impossible batch sizes practical.
+</Tip>
+
+## The backward pass
+
+Standard attention must store the full N×N attention matrix during the forward pass so the backward pass can use it during gradient computation. This is the primary source of the quadratic memory cost during training.
+
+FlashAttention takes a different approach: instead of storing the attention matrix, it stores only the log-sum-exp `L` (a compact per-row statistic from the online softmax). During the backward pass, it **recomputes** the attention matrix block by block using `L` to rescale correctly.
+
+Recomputation trades some FLOPs for a dramatic reduction in memory. Given that attention is memory-bandwidth-bound anyway, this trade is almost always favorable — recomputation costs relatively little.
+
+## Implications for training
+
+Linear memory scaling enables:
+
+- Longer sequence lengths within the same GPU memory budget
+- Larger batch sizes at fixed sequence length
+- Training larger models without activation checkpointing hacks
+- Practical training of models requiring 16k+ token contexts

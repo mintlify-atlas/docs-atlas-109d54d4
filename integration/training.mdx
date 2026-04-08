@@ -1,0 +1,120 @@
+---
+title: "Training"
+description: "Using FlashAttention for efficient transformer training"
+---
+
+FlashAttention's memory-linear attention algorithm makes it practical to train transformers at sequence lengths that would otherwise exhaust GPU memory. Because it recomputes attention on the fly during the backward pass, it also eliminates the need for storing large attention matrices as activations.
+
+## Memory savings
+
+Standard attention allocates memory quadratic in sequence length. FlashAttention's memory footprint is linear in sequence length, yielding substantial savings in practice:
+
+| Sequence length | Memory reduction vs. standard attention |
+| --------------- | --------------------------------------- |
+| 2,048           | ~10×                                    |
+| 4,096           | ~20×                                    |
+
+These savings hold regardless of whether you use dropout or attention masking.
+
+## Speed on A100 and H100
+
+FlashAttention achieves significant speedups on both forward and backward passes. The gains are most pronounced at longer sequence lengths and on GPUs with high memory bandwidth.
+
+On **A100 80GB SXM5** with FP16/BF16 (head dim 64 or 128, hidden dim 2048, batch size scaled to 16k tokens):
+
+- At sequence lengths of 2k–16k, FlashAttention reaches 2–4× combined forward+backward speedup over PyTorch standard attention.
+
+On **H100 SXM5** with FP16/BF16, speedups are higher due to increased memory bandwidth.
+
+Speedup scales with sequence length because standard attention's memory pressure grows quadratically, while FlashAttention's does not.
+
+## GPT model training
+
+The full GPT model implementation at `flash_attn/models/gpt.py` bundles FlashAttention with a set of fused auxiliary layers. Together they speed up end-to-end training **3–5× versus the HuggingFace baseline**, reaching up to **225 TFLOPs/sec per A100 (72% model FLOPs utilization)** without any activation checkpointing.
+
+To construct a GPT3-1.3B model with rotary embeddings:
+
+```python
+from transformers.models.gpt2.configuration_gpt2 import GPT2Config
+from flash_attn.models.gpt import GPTLMHeadModel
+
+seqlen = 2048
+config = GPT2Config(
+    vocab_size=50257,
+    n_positions=seqlen,
+    n_embd=2048,
+    n_layer=24,
+    n_head=16,
+    scale_attn_by_inverse_layer_idx=True,
+    rotary_emb_fraction=0.5,
+    use_flash_attn=True,
+    fused_mlp=True,
+    fused_bias_fc=True,
+    fused_dropout_add_ln=True,
+    pad_vocab_size_multiple=8,
+)
+model = GPTLMHeadModel(config)
+```
+
+## Training scripts
+
+The `training/` directory contains ready-to-run scripts for training on standard benchmarks using [Hydra](https://hydra.cc/) for configuration, PyTorch Lightning for training, and Weights & Biases for logging.
+
+**GPT2 on Openwebtext** (8 × A100 80GB, sequence length 1024):
+
+```sh
+python run.py experiment=owt/gpt2s-flash trainer.devices=8  # 125M
+python run.py experiment=owt/gpt2m-flash trainer.devices=8  # 355M
+python run.py experiment=owt/gpt2l-flash trainer.devices=8  # 760M
+python run.py experiment=owt/gpt2xl-flash trainer.devices=8 # 1.6B
+```
+
+**GPT3 on The Pile** (8 × A100 80GB, sequence length 2048):
+
+```sh
+python run.py experiment=pile/gpt3s-flash trainer.devices=8       # 125M
+python run.py experiment=pile/gpt3m-flash trainer.devices=8       # 355M
+python run.py experiment=pile/gpt3l-flash trainer.devices=8       # 760M
+python run.py experiment=pile/gpt3xl-flash trainer.devices=8      # 1.3B
+python run.py experiment=pile/gpt3-2.7B-flash-hdim128 trainer.devices=8  # 2.7B
+```
+
+Add `trainer.precision=bf16` to use bfloat16 instead of float16.
+
+Measured throughput on 8 × A100 80GB SXM4 with NVLink:
+
+| Model      | Batch size (tokens) | Throughput (tokens/sec) | Hours / 1B tokens |
+| ---------- | ------------------- | ----------------------- | ----------------- |
+| GPT3-125M  | 0.5M                | 1,310k                  | 0.21              |
+| GPT3-355M  | 0.5M                | 503k                    | 0.55              |
+| GPT3-760M  | 0.5M                | 245k                    | 1.13              |
+| GPT3-1.3B  | 1M                  | 169k                    | 1.64              |
+| GPT3-2.7B  | 1M                  | 85k                     | 3.27              |
+
+## Optimized auxiliary layers
+
+To reach maximum training efficiency, install the fused kernels alongside FlashAttention:
+
+| Layer | Description | Install |
+| ----- | ----------- | ------- |
+| Fused MLP | Fused matmul + bias + GELU forward and backward | `cd csrc/fused_dense_lib && pip install .` |
+| Cross-entropy loss | Optimized cross-entropy with in-place backward for memory savings | `cd csrc/xentropy && pip install .` |
+| Rotary embedding | Fused rotary embedding kernel | `cd csrc/rotary && pip install .` |
+| LayerNorm | Fused dropout + residual + LayerNorm for pre-norm and post-norm architectures | `cd csrc/layer_norm && pip install .` |
+
+## Gradient checkpointing
+
+<Tip>
+  FlashAttention's backward pass recomputes attention on-the-fly, so you don't
+  need separate activation checkpointing for attention layers.
+</Tip>
+
+Standard attention must store the full attention matrix (quadratic in sequence length) as an activation for the backward pass. FlashAttention avoids this by recomputing the attention values on-the-fly during the backward pass, trading a modest amount of extra compute for a large reduction in memory. This is why the GPT model implementation achieves 72% MFU without any `torch.utils.checkpoint` calls.
+
+## Mixed precision training
+
+FlashAttention requires `float16` or `bfloat16` inputs. Use `bfloat16` (`bf16`) when available (Ampere and later GPUs) for better numerical stability at the same speed. Pass `trainer.precision=bf16` in the training scripts, or cast your model manually:
+
+```python
+model = model.to(torch.bfloat16).cuda()
+```

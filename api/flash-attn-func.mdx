@@ -1,0 +1,298 @@
+---
+title: "flash_attn_func"
+description: "Standard scaled dot-product attention — the primary FlashAttention-2 entry point"
+---
+
+These functions compute scaled dot-product attention: `softmax(Q @ K^T * softmax_scale) @ V`.
+All three variants support multi-query and grouped-query attention (MQA/GQA) by passing in K/V with fewer heads than Q.
+The number of heads in Q must be divisible by the number of heads in K/V.
+
+## flash_attn_func
+
+The primary entry point. Accepts Q, K, V as separate tensors.
+
+```python
+from flash_attn import flash_attn_func
+
+flash_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+)
+```
+
+<Note>
+Set `dropout_p=0.0` during evaluation.
+</Note>
+
+### Parameters
+
+<ParamField body="q" type="torch.Tensor" required>
+  Query tensor of shape `(batch_size, seqlen, nheads, headdim)`.
+</ParamField>
+
+<ParamField body="k" type="torch.Tensor" required>
+  Key tensor of shape `(batch_size, seqlen_k, nheads_k, headdim)`. For MQA/GQA, `nheads_k` can be smaller than `nheads` in `q` as long as `nheads % nheads_k == 0`.
+</ParamField>
+
+<ParamField body="v" type="torch.Tensor" required>
+  Value tensor of shape `(batch_size, seqlen_k, nheads_k, headdim)`. Same head count rules as `k`.
+</ParamField>
+
+<ParamField body="dropout_p" type="float" default="0.0">
+  Dropout probability. Must be set to `0.0` during evaluation.
+</ParamField>
+
+<ParamField body="softmax_scale" type="float" default="1 / sqrt(headdim)">
+  Scaling factor applied to `QK^T` before the softmax. Defaults to `1 / sqrt(headdim)`.
+</ParamField>
+
+<ParamField body="causal" type="bool" default="false">
+  Whether to apply a causal attention mask, e.g. for auto-regressive modeling. The mask is aligned to the bottom-right corner of the attention matrix. If a row of the mask is all zeros, the output for that query position will be zero.
+</ParamField>
+
+<ParamField body="window_size" type="tuple[int, int]" default="(-1, -1)">
+  `(left, right)` window sizes for sliding window local attention. A value of `-1` means no limit (infinite context). When set, query at position `i` attends only to keys in the range `[i + seqlen_k - seqlen_q - left, i + seqlen_k - seqlen_q + right]` inclusive.
+</ParamField>
+
+<ParamField body="softcap" type="float" default="0.0">
+  Softcapping value for attention logits. Any value greater than `0` activates softcapping. Set to `0.0` to deactivate.
+</ParamField>
+
+<ParamField body="alibi_slopes" type="torch.Tensor">
+  ALiBi position bias slopes. Shape `(nheads,)` or `(batch_size, nheads)`, dtype `float32`. A bias of `(-alibi_slope * |i + seqlen_k - seqlen_q - j|)` is added to the attention score of query `i` and key `j`.
+</ParamField>
+
+<ParamField body="deterministic" type="bool" default="false">
+  Whether to use the deterministic implementation of the backward pass. Slightly slower and uses more memory. The forward pass is always deterministic.
+</ParamField>
+
+<ParamField body="return_attn_probs" type="bool" default="false">
+  Whether to return the attention probabilities alongside the output. For testing only — the returned probabilities are not guaranteed to be correct (they might not have the right scaling).
+</ParamField>
+
+### Return value
+
+<ResponseField name="out" type="torch.Tensor" required>
+  Attention output of shape `(batch_size, seqlen, nheads, headdim)`.
+</ResponseField>
+
+<ResponseField name="softmax_lse" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(batch_size, nheads, seqlen)`. The logsumexp of each row of `QK^T * softmax_scale` (the log of the softmax normalization factor).
+</ResponseField>
+
+<ResponseField name="attn_probs" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(batch_size, nheads, seqlen, seqlen_k)`. The softmax output, possibly with different scaling. Negative values indicate positions that were dropped by dropout; non-negative values were kept.
+</ResponseField>
+
+### Example
+
+```python
+import torch
+from flash_attn import flash_attn_func
+
+batch_size, seqlen, nheads, headdim = 2, 1024, 16, 64
+nheads_k = 4  # GQA: 4 KV heads, 16 Q heads
+
+q = torch.randn(batch_size, seqlen, nheads, headdim, device="cuda", dtype=torch.float16)
+k = torch.randn(batch_size, seqlen, nheads_k, headdim, device="cuda", dtype=torch.float16)
+v = torch.randn(batch_size, seqlen, nheads_k, headdim, device="cuda", dtype=torch.float16)
+
+# Standard attention
+out = flash_attn_func(q, k, v)
+
+# Causal attention with dropout (training)
+out = flash_attn_func(q, k, v, dropout_p=0.1, causal=True)
+
+# Sliding window attention (window of 256 tokens left, 0 right)
+out = flash_attn_func(q, k, v, causal=True, window_size=(256, 0))
+```
+
+---
+
+## flash_attn_qkvpacked_func
+
+A faster alternative when Q, K, V are already packed into a single tensor. The backward pass avoids explicit concatenation of gradients. Does not support MQA/GQA — use `flash_attn_kvpacked_func` or `flash_attn_func` for that.
+
+```python
+from flash_attn import flash_attn_qkvpacked_func
+
+flash_attn_qkvpacked_func(
+    qkv,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+)
+```
+
+### Parameters
+
+<ParamField body="qkv" type="torch.Tensor" required>
+  Packed Q, K, V tensor of shape `(batch_size, seqlen, 3, nheads, headdim)`.
+</ParamField>
+
+<ParamField body="dropout_p" type="float" default="0.0">
+  Dropout probability. Must be `0.0` during evaluation.
+</ParamField>
+
+<ParamField body="softmax_scale" type="float" default="1 / sqrt(headdim)">
+  Scaling factor applied to `QK^T` before the softmax.
+</ParamField>
+
+<ParamField body="causal" type="bool" default="false">
+  Whether to apply a causal attention mask.
+</ParamField>
+
+<ParamField body="window_size" type="tuple[int, int]" default="(-1, -1)">
+  `(left, right)` window sizes for sliding window local attention. Query at position `i` attends to keys in `[i - left, i + right]` inclusive.
+</ParamField>
+
+<ParamField body="softcap" type="float" default="0.0">
+  Softcapping value for attention logits. Any value greater than `0` activates softcapping.
+</ParamField>
+
+<ParamField body="alibi_slopes" type="torch.Tensor">
+  ALiBi slopes. Shape `(nheads,)` or `(batch_size, nheads)`, dtype `float32`. Adds a bias of `(-alibi_slope * |i - j|)` to the attention score of query `i` and key `j`.
+</ParamField>
+
+<ParamField body="deterministic" type="bool" default="false">
+  Whether to use the deterministic backward pass implementation.
+</ParamField>
+
+<ParamField body="return_attn_probs" type="bool" default="false">
+  Whether to return attention probabilities alongside the output. For testing only.
+</ParamField>
+
+### Return value
+
+<ResponseField name="out" type="torch.Tensor" required>
+  Attention output of shape `(batch_size, seqlen, nheads, headdim)`.
+</ResponseField>
+
+<ResponseField name="softmax_lse" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(batch_size, nheads, seqlen)`.
+</ResponseField>
+
+<ResponseField name="attn_probs" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(batch_size, nheads, seqlen, seqlen)`.
+</ResponseField>
+
+### Example
+
+```python
+import torch
+from flash_attn import flash_attn_qkvpacked_func
+
+batch_size, seqlen, nheads, headdim = 2, 512, 8, 64
+
+qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim, device="cuda", dtype=torch.float16)
+
+out = flash_attn_qkvpacked_func(qkv, causal=True)
+```
+
+---
+
+## flash_attn_kvpacked_func
+
+A faster alternative when K and V are already packed into a single tensor. The backward pass avoids explicit concatenation of K/V gradients. Supports MQA/GQA.
+
+```python
+from flash_attn import flash_attn_kvpacked_func
+
+flash_attn_kvpacked_func(
+    q,
+    kv,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+)
+```
+
+### Parameters
+
+<ParamField body="q" type="torch.Tensor" required>
+  Query tensor of shape `(batch_size, seqlen, nheads, headdim)`.
+</ParamField>
+
+<ParamField body="kv" type="torch.Tensor" required>
+  Packed K, V tensor of shape `(batch_size, seqlen_k, 2, nheads_k, headdim)`. For MQA/GQA, `nheads_k` may be smaller than `nheads` in `q` as long as `nheads % nheads_k == 0`.
+</ParamField>
+
+<ParamField body="dropout_p" type="float" default="0.0">
+  Dropout probability. Must be `0.0` during evaluation.
+</ParamField>
+
+<ParamField body="softmax_scale" type="float" default="1 / sqrt(headdim)">
+  Scaling factor applied to `QK^T` before the softmax.
+</ParamField>
+
+<ParamField body="causal" type="bool" default="false">
+  Whether to apply a causal attention mask. The mask is aligned to the bottom-right corner of the attention matrix.
+</ParamField>
+
+<ParamField body="window_size" type="tuple[int, int]" default="(-1, -1)">
+  `(left, right)` window sizes for sliding window local attention. Query at position `i` attends to keys in `[i + seqlen_k - seqlen_q - left, i + seqlen_k - seqlen_q + right]` inclusive.
+</ParamField>
+
+<ParamField body="softcap" type="float" default="0.0">
+  Softcapping value for attention logits. Any value greater than `0` activates softcapping.
+</ParamField>
+
+<ParamField body="alibi_slopes" type="torch.Tensor">
+  ALiBi slopes. Shape `(nheads,)` or `(batch_size, nheads)`, dtype `float32`. Adds a bias of `(-alibi_slope * |i + seqlen_k - seqlen_q - j|)` to the attention score of query `i` and key `j`.
+</ParamField>
+
+<ParamField body="deterministic" type="bool" default="false">
+  Whether to use the deterministic backward pass implementation.
+</ParamField>
+
+<ParamField body="return_attn_probs" type="bool" default="false">
+  Whether to return attention probabilities alongside the output. For testing only.
+</ParamField>
+
+### Return value
+
+<ResponseField name="out" type="torch.Tensor" required>
+  Attention output of shape `(batch_size, seqlen, nheads, headdim)`.
+</ResponseField>
+
+<ResponseField name="softmax_lse" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(batch_size, nheads, seqlen)`.
+</ResponseField>
+
+<ResponseField name="attn_probs" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(batch_size, nheads, seqlen, seqlen)`.
+</ResponseField>
+
+### Example
+
+```python
+import torch
+from flash_attn import flash_attn_kvpacked_func
+
+batch_size, seqlen, nheads, nheads_k, headdim = 2, 512, 16, 2, 64
+
+q  = torch.randn(batch_size, seqlen, nheads,   headdim, device="cuda", dtype=torch.float16)
+kv = torch.randn(batch_size, seqlen, 2, nheads_k, headdim, device="cuda", dtype=torch.float16)
+
+# GQA: 16 Q heads, 2 KV heads
+out = flash_attn_kvpacked_func(q, kv, causal=True)
+```

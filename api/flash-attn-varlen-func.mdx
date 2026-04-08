@@ -1,0 +1,392 @@
+---
+title: "flash_attn_varlen_func"
+description: "Variable-length attention for packed batches without padding"
+---
+
+These functions compute scaled dot-product attention over sequences of different lengths packed into a single tensor, eliminating the need for padding tokens.
+All three variants support MQA/GQA by passing K/V with fewer heads than Q (`nheads % nheads_k == 0`).
+
+The sequence boundaries are communicated via cumulative sequence length tensors (`cu_seqlens`). For a batch of sequences with lengths `[l0, l1, l2]`, the corresponding `cu_seqlens` is `[0, l0, l0+l1, l0+l1+l2]`.
+
+## flash_attn_varlen_func
+
+The primary variable-length entry point. Accepts Q, K, V as separate packed tensors.
+
+```python
+from flash_attn import flash_attn_varlen_func
+
+flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    block_table=None,
+)
+```
+
+<Note>
+Set `dropout_p=0.0` during evaluation.
+</Note>
+
+### Parameters
+
+<ParamField body="q" type="torch.Tensor" required>
+  Query tensor of shape `(total_q, nheads, headdim)`, where `total_q` is the total number of query tokens across all sequences in the batch.
+</ParamField>
+
+<ParamField body="k" type="torch.Tensor" required>
+  Key tensor of shape `(total_k, nheads_k, headdim)`, where `total_k` is the total number of key tokens across all sequences. For MQA/GQA, `nheads_k` may be smaller than `nheads` as long as `nheads % nheads_k == 0`.
+</ParamField>
+
+<ParamField body="v" type="torch.Tensor" required>
+  Value tensor of shape `(total_k, nheads_k, headdim)`. Same shape rules as `k`.
+</ParamField>
+
+<ParamField body="cu_seqlens_q" type="torch.Tensor" required>
+  Cumulative query sequence lengths. Shape `(batch_size + 1,)`, dtype `torch.int32`, on CUDA. Used to index into `q`. The `i`-th sequence occupies `q[cu_seqlens_q[i]:cu_seqlens_q[i+1]]`.
+</ParamField>
+
+<ParamField body="cu_seqlens_k" type="torch.Tensor" required>
+  Cumulative key sequence lengths. Shape `(batch_size + 1,)`, dtype `torch.int32`, on CUDA. Used to index into `k` and `v`.
+</ParamField>
+
+<ParamField body="max_seqlen_q" type="int" required>
+  Maximum query sequence length in the batch. Used to size internal buffers.
+</ParamField>
+
+<ParamField body="max_seqlen_k" type="int" required>
+  Maximum key sequence length in the batch. Used to size internal buffers.
+</ParamField>
+
+<ParamField body="dropout_p" type="float" default="0.0">
+  Dropout probability. Must be `0.0` during evaluation.
+</ParamField>
+
+<ParamField body="softmax_scale" type="float" default="1 / sqrt(headdim)">
+  Scaling factor applied to `QK^T` before the softmax.
+</ParamField>
+
+<ParamField body="causal" type="bool" default="false">
+  Whether to apply a causal attention mask. The mask is aligned to the bottom-right corner of each sequence's attention matrix. If a row of the mask is all zeros, the output for that query position will be zero.
+</ParamField>
+
+<ParamField body="window_size" type="tuple[int, int]" default="(-1, -1)">
+  `(left, right)` window sizes for sliding window local attention. A value of `-1` means no limit. When set, query at position `i` attends only to keys in `[i + seqlen_k - seqlen_q - left, i + seqlen_k - seqlen_q + right]` inclusive.
+</ParamField>
+
+<ParamField body="softcap" type="float" default="0.0">
+  Softcapping value for attention logits. Any value greater than `0` activates softcapping.
+</ParamField>
+
+<ParamField body="alibi_slopes" type="torch.Tensor">
+  ALiBi position bias slopes. Shape `(nheads,)` or `(batch_size, nheads)`, dtype `float32`. Adds a bias of `(-alibi_slope * |i + seqlen_k - seqlen_q - j|)` to the attention score of query `i` and key `j`.
+</ParamField>
+
+<ParamField body="deterministic" type="bool" default="false">
+  Whether to use the deterministic backward pass implementation. Slightly slower and uses more memory.
+</ParamField>
+
+<ParamField body="return_attn_probs" type="bool" default="false">
+  Whether to return attention probabilities. For testing only — the returned probabilities are not guaranteed to be correct.
+</ParamField>
+
+<ParamField body="block_table" type="torch.Tensor">
+  Block table for paged KV cache. Shape `(batch_size, max_num_blocks_per_seq)`, dtype `torch.int32`.
+</ParamField>
+
+### Return value
+
+<ResponseField name="out" type="torch.Tensor" required>
+  Attention output of shape `(total_q, nheads, headdim)`.
+</ResponseField>
+
+<ResponseField name="softmax_lse" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(nheads, total_q)`. The logsumexp of each row of `QK^T * softmax_scale`.
+</ResponseField>
+
+<ResponseField name="attn_probs" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(batch_size, nheads, seqlen, seqlen_k)`. The softmax output. Negative values indicate dropped positions.
+</ResponseField>
+
+### Example
+
+```python
+import torch
+from flash_attn import flash_attn_varlen_func
+
+device = "cuda"
+dtype  = torch.float16
+nheads, headdim = 8, 64
+
+# A batch of 3 sequences with different lengths
+seq_lens = [128, 512, 256]
+total_tokens = sum(seq_lens)
+
+q = torch.randn(total_tokens, nheads, headdim, device=device, dtype=dtype)
+k = torch.randn(total_tokens, nheads, headdim, device=device, dtype=dtype)
+v = torch.randn(total_tokens, nheads, headdim, device=device, dtype=dtype)
+
+# Build cumulative sequence length tensors
+cu_seqlens = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
+                           dtype=torch.int32, device=device)
+max_seqlen = max(seq_lens)
+
+out = flash_attn_varlen_func(
+    q, k, v,
+    cu_seqlens_q=cu_seqlens,
+    cu_seqlens_k=cu_seqlens,
+    max_seqlen_q=max_seqlen,
+    max_seqlen_k=max_seqlen,
+    causal=True,
+)
+# out shape: (total_tokens, nheads, headdim)
+```
+
+---
+
+## flash_attn_varlen_qkvpacked_func
+
+A faster alternative when Q, K, V are already packed into a single tensor. The backward pass avoids explicit gradient concatenation. Does not support MQA/GQA.
+
+```python
+from flash_attn import flash_attn_varlen_qkvpacked_func
+
+flash_attn_varlen_qkvpacked_func(
+    qkv,
+    cu_seqlens,
+    max_seqlen,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+)
+```
+
+### Parameters
+
+<ParamField body="qkv" type="torch.Tensor" required>
+  Packed Q, K, V tensor of shape `(total, 3, nheads, headdim)`, where `total` is the total number of tokens across the batch.
+</ParamField>
+
+<ParamField body="cu_seqlens" type="torch.Tensor" required>
+  Cumulative sequence lengths. Shape `(batch_size + 1,)`, dtype `torch.int32`, on CUDA. Shared by Q, K, and V (all sequences have equal query and key lengths).
+</ParamField>
+
+<ParamField body="max_seqlen" type="int" required>
+  Maximum sequence length in the batch.
+</ParamField>
+
+<ParamField body="dropout_p" type="float" default="0.0">
+  Dropout probability. Must be `0.0` during evaluation.
+</ParamField>
+
+<ParamField body="softmax_scale" type="float" default="1 / sqrt(headdim)">
+  Scaling factor applied to `QK^T` before the softmax.
+</ParamField>
+
+<ParamField body="causal" type="bool" default="false">
+  Whether to apply a causal attention mask.
+</ParamField>
+
+<ParamField body="window_size" type="tuple[int, int]" default="(-1, -1)">
+  `(left, right)` window sizes for sliding window local attention. Query at position `i` attends to keys in `[i - left, i + right]` inclusive.
+</ParamField>
+
+<ParamField body="softcap" type="float" default="0.0">
+  Softcapping value for attention logits. Any value greater than `0` activates softcapping.
+</ParamField>
+
+<ParamField body="alibi_slopes" type="torch.Tensor">
+  ALiBi slopes. Shape `(nheads,)` or `(batch_size, nheads)`, dtype `float32`. Adds a bias of `(-alibi_slope * |i - j|)`.
+</ParamField>
+
+<ParamField body="deterministic" type="bool" default="false">
+  Whether to use the deterministic backward pass implementation.
+</ParamField>
+
+<ParamField body="return_attn_probs" type="bool" default="false">
+  Whether to return attention probabilities. For testing only.
+</ParamField>
+
+### Return value
+
+<ResponseField name="out" type="torch.Tensor" required>
+  Attention output of shape `(total, nheads, headdim)`.
+</ResponseField>
+
+<ResponseField name="softmax_lse" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(nheads, total)`.
+</ResponseField>
+
+<ResponseField name="attn_probs" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(batch_size, nheads, seqlen, seqlen)`.
+</ResponseField>
+
+### Example
+
+```python
+import torch
+from flash_attn import flash_attn_varlen_qkvpacked_func
+
+device = "cuda"
+dtype  = torch.float16
+nheads, headdim = 8, 64
+
+seq_lens  = [128, 512, 256]
+total     = sum(seq_lens)
+max_seqlen = max(seq_lens)
+
+qkv = torch.randn(total, 3, nheads, headdim, device=device, dtype=dtype)
+cu_seqlens = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens), 0).tolist()),
+                           dtype=torch.int32, device=device)
+
+out = flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens, max_seqlen, causal=True)
+```
+
+---
+
+## flash_attn_varlen_kvpacked_func
+
+A faster alternative when K and V are packed together. Supports MQA/GQA.
+
+```python
+from flash_attn import flash_attn_varlen_kvpacked_func
+
+flash_attn_varlen_kvpacked_func(
+    q,
+    kv,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+)
+```
+
+### Parameters
+
+<ParamField body="q" type="torch.Tensor" required>
+  Query tensor of shape `(total_q, nheads, headdim)`.
+</ParamField>
+
+<ParamField body="kv" type="torch.Tensor" required>
+  Packed K, V tensor of shape `(total_k, 2, nheads_k, headdim)`. For MQA/GQA, `nheads_k` may be smaller than `nheads` as long as `nheads % nheads_k == 0`.
+</ParamField>
+
+<ParamField body="cu_seqlens_q" type="torch.Tensor" required>
+  Cumulative query sequence lengths. Shape `(batch_size + 1,)`, dtype `torch.int32`, on CUDA.
+</ParamField>
+
+<ParamField body="cu_seqlens_k" type="torch.Tensor" required>
+  Cumulative key sequence lengths. Shape `(batch_size + 1,)`, dtype `torch.int32`, on CUDA.
+</ParamField>
+
+<ParamField body="max_seqlen_q" type="int" required>
+  Maximum query sequence length in the batch.
+</ParamField>
+
+<ParamField body="max_seqlen_k" type="int" required>
+  Maximum key sequence length in the batch.
+</ParamField>
+
+<ParamField body="dropout_p" type="float" default="0.0">
+  Dropout probability. Must be `0.0` during evaluation.
+</ParamField>
+
+<ParamField body="softmax_scale" type="float" default="1 / sqrt(headdim)">
+  Scaling factor applied to `QK^T` before the softmax.
+</ParamField>
+
+<ParamField body="causal" type="bool" default="false">
+  Whether to apply a causal attention mask. The mask is aligned to the bottom-right corner of the attention matrix.
+</ParamField>
+
+<ParamField body="window_size" type="tuple[int, int]" default="(-1, -1)">
+  `(left, right)` window sizes for sliding window local attention. Query at position `i` attends to keys in `[i + seqlen_k - seqlen_q - left, i + seqlen_k - seqlen_q + right]` inclusive.
+</ParamField>
+
+<ParamField body="softcap" type="float" default="0.0">
+  Softcapping value for attention logits. Any value greater than `0` activates softcapping.
+</ParamField>
+
+<ParamField body="alibi_slopes" type="torch.Tensor">
+  ALiBi slopes. Shape `(nheads,)` or `(batch_size, nheads)`, dtype `float32`. Adds a bias of `(-alibi_slope * |i + seqlen_k - seqlen_q - j|)`.
+</ParamField>
+
+<ParamField body="deterministic" type="bool" default="false">
+  Whether to use the deterministic backward pass implementation.
+</ParamField>
+
+<ParamField body="return_attn_probs" type="bool" default="false">
+  Whether to return attention probabilities. For testing only.
+</ParamField>
+
+### Return value
+
+<ResponseField name="out" type="torch.Tensor" required>
+  Attention output of shape `(total_q, nheads, headdim)`.
+</ResponseField>
+
+<ResponseField name="softmax_lse" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(nheads, total_q)`.
+</ResponseField>
+
+<ResponseField name="attn_probs" type="torch.Tensor">
+  Returned only when `return_attn_probs=True`. Shape `(batch_size, nheads, seqlen, seqlen_k)`.
+</ResponseField>
+
+### Example
+
+```python
+import torch
+from flash_attn import flash_attn_varlen_kvpacked_func
+
+device = "cuda"
+dtype  = torch.float16
+nheads, nheads_k, headdim = 16, 2, 64
+
+seq_lens_q = [128, 512, 256]
+seq_lens_k = [128, 512, 256]  # equal-length example; can differ for cross-attention
+
+total_q = sum(seq_lens_q)
+total_k = sum(seq_lens_k)
+
+q  = torch.randn(total_q, nheads,   headdim, device=device, dtype=dtype)
+kv = torch.randn(total_k, 2, nheads_k, headdim, device=device, dtype=dtype)
+
+cu_seqlens_q = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens_q), 0).tolist()),
+                              dtype=torch.int32, device=device)
+cu_seqlens_k = torch.tensor([0] + list(torch.cumsum(torch.tensor(seq_lens_k), 0).tolist()),
+                              dtype=torch.int32, device=device)
+
+out = flash_attn_varlen_kvpacked_func(
+    q, kv,
+    cu_seqlens_q=cu_seqlens_q,
+    cu_seqlens_k=cu_seqlens_k,
+    max_seqlen_q=max(seq_lens_q),
+    max_seqlen_k=max(seq_lens_k),
+    causal=True,
+)
+```

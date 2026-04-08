@@ -1,0 +1,278 @@
+---
+title: "flash_attn_with_kvcache"
+description: "KV cache inference — incremental decoding with optional rotary embeddings and paged KV cache"
+---
+
+<Warning>
+This function does not support a backward pass. It is intended for inference only.
+</Warning>
+
+`flash_attn_with_kvcache` combines a KV-cache update and attention computation into a single kernel call, making it the recommended path for autoregressive decoding.
+
+If `k` and `v` are provided, `k_cache` and `v_cache` are updated **in place** with the new tokens before attention is computed. This allows you to pass in the cached keys/values from the previous step, append the new keys/values from the current step, and run attention over the full updated cache — all in one kernel.
+
+Supports multi-query and grouped-query attention (MQA/GQA) by passing KV caches with fewer heads than Q. The number of heads in Q must be divisible by the number of heads in the KV cache.
+
+## Signature
+
+```python
+from flash_attn import flash_attn_with_kvcache
+
+flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens=None,
+    cache_batch_idx=None,
+    cache_leftpad=None,
+    block_table=None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    rotary_interleaved=True,
+    alibi_slopes=None,
+    num_splits=0,
+    return_softmax_lse=False,
+)
+```
+
+## Parameters
+
+### Required inputs
+
+<ParamField body="q" type="torch.Tensor" required>
+  Query tensor of shape `(batch_size, seqlen, nheads, headdim)`.
+</ParamField>
+
+<ParamField body="k_cache" type="torch.Tensor" required>
+  Key cache tensor. Shape `(batch_size_cache, seqlen_cache, nheads_k, headdim)` for a standard (non-paged) cache, or `(num_blocks, page_block_size, nheads_k, headdim)` when using a paged KV cache (`block_table` must be provided). `page_block_size` must be a multiple of 256. The last dimension must be contiguous.
+</ParamField>
+
+<ParamField body="v_cache" type="torch.Tensor" required>
+  Value cache tensor. Same shape rules as `k_cache`. The last dimension must be contiguous.
+</ParamField>
+
+### New tokens (optional)
+
+<ParamField body="k" type="torch.Tensor">
+  New key tokens to append to the cache. Shape `(batch_size, seqlen_new, nheads_k, headdim)`. If provided, `k_cache` is updated in place at the positions indicated by `cache_seqlens` before attention is run. The cache must be pre-allocated with enough capacity to hold the new values.
+</ParamField>
+
+<ParamField body="v" type="torch.Tensor">
+  New value tokens to append to the cache. Shape `(batch_size, seqlen_new, nheads_k, headdim)`. Same rules as `k`.
+</ParamField>
+
+### Rotary embeddings (optional)
+
+<ParamField body="rotary_cos" type="torch.Tensor">
+  Cosine table for rotary position embeddings. Shape `(seqlen_ro, rotary_dim / 2)`. Only applicable when `k` and `v` are also provided. `rotary_dim` must be divisible by 16.
+
+  The new key `k` is rotated using the entries at positions `cache_seqlens`, `cache_seqlens + 1`, etc. The query `q` is rotated at the same positions when `causal=True` or a local window is active; otherwise all query positions are treated as `cache_seqlens`.
+</ParamField>
+
+<ParamField body="rotary_sin" type="torch.Tensor">
+  Sine table for rotary position embeddings. Shape `(seqlen_ro, rotary_dim / 2)`. Same rules as `rotary_cos`.
+</ParamField>
+
+<ParamField body="rotary_interleaved" type="bool" default="true">
+  Only applicable when `rotary_cos` and `rotary_sin` are provided. If `True`, the rotary embedding combines dimensions `(0, 1)`, `(2, 3)`, etc. If `False`, it combines dimensions `(0, rotary_dim/2)`, `(1, rotary_dim/2 + 1)`, etc. (GPT-NeoX style).
+</ParamField>
+
+### Cache indexing
+
+<ParamField body="cache_seqlens" type="int or torch.Tensor">
+  The current filled length(s) of the KV cache. Either a single `int` (broadcast to all sequences) or a tensor of shape `(batch_size,)`, dtype `torch.int32`. New tokens `k`/`v` are written starting at these offsets.
+</ParamField>
+
+<ParamField body="cache_batch_idx" type="torch.Tensor">
+  Indices into the KV cache batch dimension. Shape `(batch_size,)`, dtype `torch.int32`. If `None`, cache batch indices are assumed to be `[0, 1, 2, ..., batch_size - 1]`. If indices are not distinct and `k`/`v` are provided, the cache update behavior at duplicate indices is undefined.
+</ParamField>
+
+<ParamField body="cache_leftpad" type="torch.Tensor">
+  Left-padding offsets into the KV cache. Shape `(batch_size,)`, dtype `torch.int32`. Specifies the index at which the KV cache for each sequence starts. If `None`, assumes `0` for all sequences.
+</ParamField>
+
+<ParamField body="block_table" type="torch.Tensor">
+  Block table for paged KV cache. Shape `(batch_size, max_num_blocks_per_seq)`, dtype `torch.int32`. When provided, `k_cache` and `v_cache` must use the paged layout `(num_blocks, page_block_size, nheads_k, headdim)`.
+</ParamField>
+
+### Attention options
+
+<ParamField body="softmax_scale" type="float" default="1 / sqrt(headdim)">
+  Scaling factor applied to `QK^T` before the softmax.
+</ParamField>
+
+<ParamField body="causal" type="bool" default="false">
+  Whether to apply a causal attention mask. The mask is aligned to the bottom-right corner of the attention matrix. If a row of the mask is all zeros, the output for that query position will be zero.
+
+  Example with `seqlen_q=2`, `seqlen_k=5` (1 = kept, 0 = masked):
+  ```
+  1 1 1 1 0
+  1 1 1 1 1
+  ```
+</ParamField>
+
+<ParamField body="window_size" type="tuple[int, int]" default="(-1, -1)">
+  `(left, right)` window sizes for sliding window local attention. A value of `-1` means no limit. When set, query at position `i` attends only to keys in `[i + seqlen_k - seqlen_q - left, i + seqlen_k - seqlen_q + right]` inclusive.
+</ParamField>
+
+<ParamField body="softcap" type="float" default="0.0">
+  Softcapping value for attention logits. Any value greater than `0` activates softcapping.
+</ParamField>
+
+<ParamField body="alibi_slopes" type="torch.Tensor">
+  ALiBi position bias slopes. Shape `(nheads,)` or `(batch_size, nheads)`, dtype `float32`. Adds a bias of `(-alibi_slope * |i + seqlen_k - seqlen_q - j|)` to the attention score of query `i` and key `j`.
+</ParamField>
+
+<ParamField body="num_splits" type="int" default="0">
+  Number of chunks to split the key/value sequence along when computing attention. `0` enables an automatic heuristic. `1` disables splitting. Values greater than `1` force that number of splits. Leave at the default unless you have a specific reason to change it.
+</ParamField>
+
+<ParamField body="return_softmax_lse" type="bool" default="false">
+  Whether to return the logsumexp of the attention scores alongside the output.
+</ParamField>
+
+## Return value
+
+<ResponseField name="out" type="torch.Tensor" required>
+  Attention output of shape `(batch_size, seqlen, nheads, headdim)`.
+</ResponseField>
+
+<ResponseField name="softmax_lse" type="torch.Tensor">
+  Returned only when `return_softmax_lse=True`. Shape `(batch_size, nheads, seqlen)`. The logsumexp of each row of `QK^T * softmax_scale`.
+</ResponseField>
+
+## Examples
+
+### Basic decode loop
+
+Pre-allocate a KV cache for the maximum sequence length and decode token by token.
+
+```python
+import torch
+from flash_attn import flash_attn_with_kvcache
+
+device   = "cuda"
+dtype    = torch.float16
+batch_size, nheads, nheads_k, headdim = 4, 32, 8, 128
+max_seqlen_cache = 2048
+
+# Pre-allocate KV cache
+k_cache = torch.zeros(batch_size, max_seqlen_cache, nheads_k, headdim, device=device, dtype=dtype)
+v_cache = torch.zeros(batch_size, max_seqlen_cache, nheads_k, headdim, device=device, dtype=dtype)
+
+# Track how many tokens are in the cache for each sequence
+cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+# Decode loop — generate one token per step
+for step in range(64):
+    # Single new query token per sequence
+    q = torch.randn(batch_size, 1, nheads,   headdim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, 1, nheads_k, headdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, 1, nheads_k, headdim, device=device, dtype=dtype)
+
+    # k_cache and v_cache are updated in place; attention runs over the full cache
+    out = flash_attn_with_kvcache(
+        q, k_cache, v_cache,
+        k=k, v=v,
+        cache_seqlens=cache_seqlens,
+        causal=True,
+    )
+    cache_seqlens += 1
+
+# out shape: (batch_size, 1, nheads, headdim)
+```
+
+### Rotary embeddings
+
+Apply rotary position embeddings (RoPE) to new keys and queries during decoding.
+
+```python
+import torch
+from flash_attn import flash_attn_with_kvcache
+
+device   = "cuda"
+dtype    = torch.float16
+batch_size, nheads, nheads_k, headdim = 2, 16, 4, 128
+rotary_dim   = 64   # must be divisible by 16
+max_seqlen   = 1024
+
+k_cache = torch.zeros(batch_size, max_seqlen, nheads_k, headdim, device=device, dtype=dtype)
+v_cache = torch.zeros(batch_size, max_seqlen, nheads_k, headdim, device=device, dtype=dtype)
+
+# Precompute the full cosine/sine tables up to max_seqlen
+theta = 1.0 / (10000 ** (torch.arange(0, rotary_dim, 2, device=device).float() / rotary_dim))
+positions = torch.arange(max_seqlen, device=device).float()
+angles = torch.outer(positions, theta)  # (max_seqlen, rotary_dim / 2)
+rotary_cos = angles.cos().to(dtype)
+rotary_sin = angles.sin().to(dtype)
+
+cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+for step in range(32):
+    q = torch.randn(batch_size, 1, nheads,   headdim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, 1, nheads_k, headdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, 1, nheads_k, headdim, device=device, dtype=dtype)
+
+    out = flash_attn_with_kvcache(
+        q, k_cache, v_cache,
+        k=k, v=v,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=cache_seqlens,
+        rotary_interleaved=False,  # GPT-NeoX style
+        causal=True,
+    )
+    cache_seqlens += 1
+```
+
+### Paged KV cache
+
+Use a block table to manage non-contiguous KV cache memory (vLLM-style paged attention).
+
+```python
+import torch
+from flash_attn import flash_attn_with_kvcache
+
+device   = "cuda"
+dtype    = torch.float16
+batch_size, nheads, nheads_k, headdim = 2, 16, 4, 128
+
+# Paged cache parameters — page_block_size must be a multiple of 256
+num_blocks     = 64
+page_block_size = 256
+
+# Physical KV cache storage: (num_blocks, page_block_size, nheads_k, headdim)
+k_cache = torch.zeros(num_blocks, page_block_size, nheads_k, headdim, device=device, dtype=dtype)
+v_cache = torch.zeros(num_blocks, page_block_size, nheads_k, headdim, device=device, dtype=dtype)
+
+# Block table: maps each sequence's logical blocks to physical block indices
+# Shape: (batch_size, max_num_blocks_per_seq)
+max_blocks_per_seq = 8
+block_table = torch.zeros(batch_size, max_blocks_per_seq, dtype=torch.int32, device=device)
+# Assign physical blocks to each sequence (simple sequential assignment here)
+for b in range(batch_size):
+    for blk in range(max_blocks_per_seq):
+        block_table[b, blk] = b * max_blocks_per_seq + blk
+
+cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+for step in range(32):
+    q = torch.randn(batch_size, 1, nheads,   headdim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, 1, nheads_k, headdim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, 1, nheads_k, headdim, device=device, dtype=dtype)
+
+    out = flash_attn_with_kvcache(
+        q, k_cache, v_cache,
+        k=k, v=v,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        causal=True,
+    )
+    cache_seqlens += 1
+```
